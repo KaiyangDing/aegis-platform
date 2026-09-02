@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# 工具缓存
+.pytest_cache/
+.ruff_cache/
+
+# 环境与密钥（.env 永不入库；模板走 .env.example）
+.env
+
+# IDE
+.idea/
+
+# 本地私有：会话入口与私人计划不入库（对外文档只走 docs/adr 与 README）
+CLAUDE.md
+docs/private/

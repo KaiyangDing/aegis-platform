@@ -1,0 +1,68 @@
+[project]
+name = "aegis-platform"
+version = "0.1.0"
+description = "Aegis v2 —— LangChain/LangGraph 框架原生多租户客服 Agent 平台"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "alembic>=1.19.1",
+    "arq>=0.28.0",
+    "asyncpg>=0.31.0",
+    "fastapi>=0.141.1",
+    "fastapi-limiter==0.1.6",
+    "httpx>=0.28.1",
+    "langchain-core>=1.6.1",
+    "langchain-openai>=1.6.0",
+    "langgraph>=1.2.11",
+    "langgraph-checkpoint-postgres>=3.1.2",
+    "psycopg[binary]>=3.3.5",
+    "pybreaker>=1.4.1",
+    "pydantic-settings>=2.15.0",
+    "pyjwt>=2.13.0",
+    "redis>=5.3.1",
+    "sqlalchemy[asyncio]>=2.0.52",
+    "structlog>=26.1.0",
+    "uvicorn[standard]>=0.52.4",
+]
+
+[dependency-groups]
+dev = [
+    "import-linter>=2.14",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "respx>=0.23.1",
+    "ruff>=0.16.5",
+]
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["."]
+
+[tool.importlinter]
+root_package = "app"
+
+[[tool.importlinter.contracts]]
+name = "core 不依赖兄弟包"
+type = "forbidden"
+source_modules = ["app.core"]
+forbidden_modules = ["app.engine", "app.domain", "app.routers"]
+
+[[tool.importlinter.contracts]]
+name = "engine 只依赖 core"
+type = "forbidden"
+source_modules = ["app.engine"]
+forbidden_modules = ["app.domain", "app.routers"]
+
+[[tool.importlinter.contracts]]
+name = "domain 只依赖 core"
+type = "forbidden"
+source_modules = ["app.domain"]
+forbidden_modules = ["app.engine", "app.routers"]
+
