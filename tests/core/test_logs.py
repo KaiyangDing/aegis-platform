@@ -3,7 +3,17 @@
 import json
 import logging
 
+import pytest
+import structlog
+
 from app.core.logs import configure_logging, get_logger
+
+
+@pytest.fixture(autouse=True)
+def _reset_structlog():
+    """configure_logging 改的是进程级全局配置：用完恢复默认，别让 WARNING 门槛泄漏到别的测试。"""
+    yield
+    structlog.reset_defaults()
 
 
 def test_warning_is_emitted_as_json_line(capsys):

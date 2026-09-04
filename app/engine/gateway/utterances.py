@@ -6,6 +6,7 @@
 
 # --- 异常翻译（M1.1 errors.classify） ---
 HTTP_STATUS = "HTTP {status}: {snippet}"
+CONTEXT_OVERFLOW = "上下文超长: {detail}"
 STREAM_ERROR_EVENT = "流内错误 {code}: {detail}"
 POOL_TIMEOUT = "本地连接池排队超时: {detail}"
 TIMEOUT = "超时: {detail}"
@@ -21,6 +22,9 @@ API_KEY_MISSING = "API key 未配置（检查 .env 的 DASHSCOPE_API_KEY）"
 # --- 受控重试与超时（M1.3） ---
 FIRST_CHUNK_TIMEOUT = "首块超时 >{wait:.1f}s（上游挂起）"
 STREAM_TRUNCATED = "流被截断：未收到终止哨兵"
+STREAM_EMPTY = "流为空：上游一块都没吐"
+OUTBOUND_GATE_TIMEOUT = "出站闸排队超时（等待 {wait:.1f}s 未取得令牌）"
+RETRY_POLICY_INVALID = "RetryPolicy 参数非法: {field}"
 
 # --- 候选环与终局（M1.4a） ---
 ROUTE_MISSING = "档位 {tier} 没有配置任何候选（检查 MODEL_ROUTES）"

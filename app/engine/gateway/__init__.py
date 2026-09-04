@@ -10,6 +10,7 @@ from app.engine.gateway.errors import (
     GatewayOverloadedError,
     GatewayRejected,
     GatewayStreamInterrupted,
+    OutboundGateTimeout,
     ProviderError,
     ProviderServerError,
     ProviderTimeoutError,
@@ -17,6 +18,11 @@ from app.engine.gateway.errors import (
     TenantQuotaExceeded,
     classify,
     sanitize_error_text,
+)
+from app.engine.gateway.resilience import (
+    RetryPolicy,
+    complete_with_retry,
+    compute_backoff,
 )
 from app.engine.gateway.routing import (
     TIERS,
@@ -37,14 +43,18 @@ __all__ = [
     "GatewayOverloadedError",
     "GatewayRejected",
     "GatewayStreamInterrupted",
+    "OutboundGateTimeout",
     "ProviderError",
     "ProviderServerError",
     "ProviderTimeoutError",
     "RateLimitedError",
+    "RetryPolicy",
     "TenantQuotaExceeded",
     "Tier",
     "build_candidates",
     "classify",
+    "complete_with_retry",
+    "compute_backoff",
     "make_candidate",
     "parse_routes",
     "sanitize_error_text",

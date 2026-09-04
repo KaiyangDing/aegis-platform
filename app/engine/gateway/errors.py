@@ -9,17 +9,20 @@ ProviderError 家族只在网关内部流转（重试白名单、熔断记账、
 翻译源（v1 是 httpx 状态码，v2 是 SDK 异常对象）：
   openai.APIStatusError 按 status_code 分段；APITimeoutError / APIConnectionError 按 __cause__ 链
   区分本地连接池排队（PoolTimeout）与真超时；流内 error 事件是无状态码的裸 openai.APIError；
-  langchain-openai 的 StreamChunkTimeoutError 是 TimeoutError 子类。
+  langchain-openai 的 StreamChunkTimeoutError 是 TimeoutError 子类；
+  langchain-core 在候选一块都没吐时抛的 ValueError 按消息前缀识别为零块流（探针⑨）。
 未知异常返回 None 让调用方裸抛——把编程错误伪装成上游故障会藏起 bug。
 """
 
 import json
+import math
 import re
 import time
 from email.utils import parsedate_to_datetime
 
 import httpx2
 import openai
+from langchain_core.exceptions import ContextOverflowError
 
 from app.engine.gateway import utterances as u
 
@@ -46,6 +49,10 @@ class RateLimitedError(ProviderError):
     ) -> None:
         super().__init__(provider, message)
         self.retry_after = retry_after
+
+
+class OutboundGateTimeout(RateLimitedError):
+    """出站闸限时取令牌失败——本地排队而非上游 429。候选环按 429 待遇换路、不进账，且不作为终局死因。"""
 
 
 class ProviderTimeoutError(ProviderError):
@@ -91,6 +98,8 @@ class GatewayStreamInterrupted(GatewayError):
 # ---------------------------------------------------------------- 消毒与 Retry-After
 
 _KEY_PATTERN = re.compile(r"sk-[A-Za-z0-9_-]{8,}")
+# langchain-core 1.6.1 BaseChatModel.astream：_astream 零块时抛的 ValueError 消息（探针⑨；测试端到端钉住）
+EMPTY_STREAM_MARKER = "No generation chunks were returned"
 
 
 def sanitize_error_text(text: str, limit: int = 200) -> str:
@@ -102,12 +111,17 @@ def sanitize_error_text(text: str, limit: int = 200) -> str:
     return _KEY_PATTERN.sub(u.KEY_MASK, text)[:limit]
 
 
+def _non_negative_finite(seconds: float) -> float | None:
+    """外部给的等待秒数只认非负有限值：负数当 0（立刻可重试），NaN/inf 当没给。"""
+    return max(0.0, seconds) if math.isfinite(seconds) else None
+
+
 def parse_retry_after(value: str | None) -> float | None:
     """Retry-After 双格式：秒数或 HTTP-date；解析失败退化 None 走指数退避。外部输入永不裸穿 ValueError。"""
     if value is None:
         return None
     try:
-        return float(value)
+        return _non_negative_finite(float(value))
     except ValueError:
         pass
     try:
@@ -126,9 +140,11 @@ def retry_after_from(exc: BaseException) -> float | None:
     ms = headers.get("retry-after-ms")
     if ms is not None:
         try:
-            return max(0.0, float(ms) / 1000)
+            parsed = _non_negative_finite(float(ms) / 1000)
         except ValueError:
-            pass
+            parsed = None
+        if parsed is not None:
+            return parsed
     return parse_retry_after(headers.get("retry-after"))
 
 
@@ -178,6 +194,12 @@ def classify(provider: str, exc: BaseException) -> GatewayError | None:
     """
     if isinstance(exc, ProviderError | GatewayOverloadedError):
         return exc
+
+    if isinstance(exc, ContextOverflowError):
+        # langchain-openai 把"上下文超长"重包为 ContextOverflowError（400 变体带状态码，流内 error 事件变体无）：
+        # 请求本身装不下，确定性拒绝，不是上游故障
+        detail = _snippet(exc) if isinstance(exc, openai.APIError) else _describe(exc)
+        return BadRequestError(provider, u.CONTEXT_OVERFLOW.format(detail=detail))
 
     if isinstance(exc, openai.APIStatusError):
         status = exc.status_code
@@ -234,5 +256,8 @@ def classify(provider: str, exc: BaseException) -> GatewayError | None:
         return ProviderServerError(
             provider, u.CONNECT_FAILED.format(detail=_describe(exc))
         )
+
+    if isinstance(exc, ValueError) and str(exc).startswith(EMPTY_STREAM_MARKER):
+        return ProviderServerError(provider, u.STREAM_EMPTY)
 
     return None
