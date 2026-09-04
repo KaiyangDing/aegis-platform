@@ -27,6 +27,7 @@ OUTBOUND_GATE_TIMEOUT = "出站闸排队超时（等待 {wait:.1f}s 未取得令
 RETRY_POLICY_INVALID = "RetryPolicy 参数非法: {field}"
 
 # --- 候选环与终局（M1.4a） ---
+SYNC_NOT_SUPPORTED = "网关只支持异步调用（ainvoke/astream）"
 ROUTE_MISSING = "档位 {tier} 没有配置任何候选（检查 MODEL_ROUTES）"
 STREAM_INTERRUPTED = "流中断于 {provider}:{model}"
 FIRST_CHUNK_BUDGET_EXHAUSTED = "档位 {tier} 首块预算 {deadline_s}s 耗尽（候选链未走完）"
@@ -49,3 +50,7 @@ LOG_BUDGET_READ_FAILED = "预算读取失败，本次放行（fail-open）"
 LOG_CACHE_DEGRADED = "精确缓存不可用，降级为直通"
 LOG_CACHE_RECOVERED = "精确缓存恢复，切回缓存路径"
 LOG_BREAKER_STATE_CHANGED = "熔断器状态变化"
+OUTBOUND_LIMITER_INVALID = "出站闸参数非法：rate/burst 须 > 0，max_wait 须 ≥ 0"
+BREAKER_POLICY_INVALID = "熔断参数非法：fail_max ≥ 1，四个时长为有限正数，fail_window > reset_timeout + probe_ttl"
+LOG_BREAKER_DEGRADED = "熔断存储不可用，降级为进程内状态机（粘滞 probe_interval；全集群单探针在降级期失效）"
+LOG_BREAKER_RECOVERED = "熔断存储恢复，切回共享态"

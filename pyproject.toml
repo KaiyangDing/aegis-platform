@@ -18,7 +18,6 @@ dependencies = [
     "langgraph-checkpoint-postgres>=3.1.2",
     "openai>=3.7.0",
     "psycopg[binary]>=3.3.5",
-    "pybreaker>=1.4.1",
     "pydantic-settings>=2.15.0",
     "pyjwt>=2.13.0",
     "redis>=5.3.1",
