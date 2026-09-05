@@ -504,3 +504,66 @@ async def test_fallback_stays_quiet_while_redis_is_healthy(flaky, key):
     assert [e["store"] for e in logs if e["event"] == u.LOG_BREAKER_STATE_CHANGED] == [
         "redis"
     ]
+
+
+# ---------------------------------------------------------------- Redis 版：迟到成功不恢复（M1.7）
+
+
+class _StalledPipeline:
+    """真 pipeline 的外壳：execute 挂到 gate 放行——模拟健康期发出、降级后才返回的响应。"""
+
+    def __init__(self, pipe, gate: asyncio.Event) -> None:
+        self._pipe, self._gate = pipe, gate
+
+    async def __aenter__(self):
+        await self._pipe.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc):
+        return await self._pipe.__aexit__(*exc)
+
+    def __getattr__(self, name):
+        return getattr(self._pipe, name)  # exists/get 入队照旧
+
+    async def execute(self):
+        await self._gate.wait()
+        return await self._pipe.execute()
+
+
+class StallOnce(FlakyClient):
+    """第一次 pipeline 的 execute 挂起到 gate.set()；之后的触点按 dead 开关正常失败。"""
+
+    def __init__(self, real) -> None:
+        super().__init__(real)
+        self.gate = asyncio.Event()
+        self._stalled = False
+
+    def pipeline(self, transaction: bool = True):
+        if self._stalled:
+            return super().pipeline(transaction)
+        self._stalled = True
+        self.touches += 1
+        return _StalledPipeline(self.real.pipeline(transaction=transaction), self.gate)
+
+
+async def test_stale_in_flight_success_does_not_undo_degradation(redis_async, key):
+    """健康期发出、降级后才返回的成功不是探针：只返回自己的裁决，不恢复、不记恢复日志、粘滞照旧。"""
+    if not hasattr(RedisBreaker, "degraded"):
+        pytest.skip("M1.7 未敲：RedisBreaker 尚无 degraded 属性")
+    client = StallOnce(redis_async)
+    b = RedisBreaker(client, FAST)
+    stale = asyncio.create_task(b.allow(key))  # 健康期发出，卡在 execute
+    await asyncio.sleep(0)
+    client.dead = True
+    with capture_logs() as logs:
+        assert await b.allow(key) == "allow"  # 失败 → 降级，备胎裁决
+        assert b.degraded
+        client.gate.set()
+        assert await stale == "allow"  # 迟到的成功：裁决照返
+    assert b.degraded  # 不恢复
+    events = [e["event"] for e in logs]
+    assert events.count(u.LOG_BREAKER_DEGRADED) == 1
+    assert u.LOG_BREAKER_RECOVERED not in events
+    n = client.touches
+    assert await b.allow(key) == "allow"  # 粘滞仍在：不碰 Redis
+    assert client.touches == n

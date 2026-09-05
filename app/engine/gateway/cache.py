@@ -20,7 +20,8 @@ response_metadata["aegis_cached"]=True（同值可安全合并，探针⑱），
 
 故障只告警 + 粘滞降级（与熔断同款，ADR-007 决策 6）：CacheStore 是进程级单例，任一 Redis 触点异常即降级为直通，
 probe_interval 内不再碰 Redis；get/put 共用一个探针窗口（同一请求内 get 探针成功即切回，紧随其后的 put 走正常路径）；
-探针失败顺延窗口；成功即恢复并记日志。TenantCache 是按租户装配的薄视图（组合根每请求构造）。
+探针失败顺延窗口；只有被指派的那次探针成功才恢复并记日志（健康期发出、降级后才返回的迟到成功只返回自己的结果，不改状态）。
+TenantCache 是按租户装配的薄视图（组合根每请求构造）。
 """
 
 import hashlib
@@ -208,15 +209,18 @@ class CacheStore:
         return True
 
     async def _touch(self, op: str, call: Callable[[], Awaitable[Any]]) -> Any | None:
-        if self._degraded and not self._probe_due():
-            return None
+        probing = False
+        if self._degraded:
+            if not self._probe_due():
+                return None
+            probing = True  # 只有领到探针的这次调用才有资格恢复
         try:
             result = await call()
         except Exception:
             if self._note_degraded():
                 logger.warning(u.LOG_CACHE_DEGRADED, op=op, exc_info=True)
             return None
-        if self._degraded:
+        if probing:
             self._degraded = False
             logger.warning(u.LOG_CACHE_RECOVERED, op=op)
         return result

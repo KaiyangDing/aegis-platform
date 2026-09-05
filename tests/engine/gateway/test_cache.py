@@ -1,6 +1,8 @@
 """租户前缀精确缓存（M1.5a）：key 三原则（纯函数）/ 值往返与盖章 / 完整性守卫 / 跨租对抗（真 Redis db1）/
 故障降级粘滞（FlakyClient 驱动，零真等）。"""
 
+import asyncio
+
 import pytest
 from langchain_core.messages import (
     AIMessage,
@@ -357,3 +359,42 @@ async def test_healthy_store_roundtrips_through_fake_client():
     await store.delete("k")
     assert await store.get("k") is None
     assert not store.degraded
+
+
+# ---------------------------------------------------------------- 迟到成功不恢复（M1.7）
+
+
+class StallOnceClient(FakeClient):
+    """第一次 get 挂到 gate.set() 才返回（且不看 dead 开关）：模拟健康期发出、降级后才返回的响应。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+        self._stalled = False
+
+    async def get(self, key: str) -> str | None:
+        if self._stalled:
+            return await super().get(key)
+        self._stalled = True
+        self.touches += 1
+        await self.gate.wait()
+        return self.data.get(key)
+
+
+async def test_stale_in_flight_success_does_not_undo_degradation(clock):
+    client = StallOnceClient()
+    store = CacheStore(client, ttl_seconds=60, probe_interval=5.0)
+    client.data["k"] = "v"
+    stale = asyncio.create_task(store.get("k"))  # 健康期发出，卡住
+    await asyncio.sleep(0)
+    client.dead = True
+    with capture_logs() as logs:
+        assert await store.get("k") is None  # 失败 → 降级
+        assert store.degraded
+        client.gate.set()
+        assert await stale == "v"  # 迟到的成功：结果照返
+    assert store.degraded  # 不恢复
+    assert [log["event"] for log in logs] == [u.LOG_CACHE_DEGRADED]
+    n = client.touches
+    assert await store.get("k") is None  # 粘滞仍在：不碰 Redis
+    assert client.touches == n

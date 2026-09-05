@@ -31,6 +31,7 @@
 - 401 响应体中的密钥片段会原样出现在 SDK 异常消息里，经翻译表后被打码。
 - `StreamChunkTimeoutError` 从 `langchain_openai` 顶层导入，是 `TimeoutError` 子类，不属 openai 异常族。
 
+- 增补（2026-09-05 联网冒烟，`reports/2026-09-05-smoke-dashscope.md`）：DashScope 兼容端点的真实 SSE 形态——路由表四个候选均存在并接受 `enable_thinking=false`；`stream_options.include_usage` 下 usage 单独作为最后一块返回且该块 `choices` 为空，`finish_reason` 在其前一块，`[DONE]` 哨兵在场；`enable_thinking=true` 时 `reasoning_content` 作为 delta 字段出现，思考 token 计入 `completion_tokens`（按输出计费），`thinking_budget` 被接受；经本仓网关走一次 fast 档，框架侧 `usage_metadata` 落在末块、`finish_reason` 在场，与本 ADR 的截断判据和 ADR-006 的首块判据一致。定量数字只在报告中。
 ## 后果
 
 - 契约边界从数据类型（`LLMChunk`）改锚在 chat model 行为上；运行时层直接消费 langchain 消息类型；缓存持久化值将使用自家最小 schema（后续 ADR）。

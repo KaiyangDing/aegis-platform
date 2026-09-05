@@ -17,7 +17,8 @@ release_probe 归还无裁决的试探令牌。进账谓词（只有 5xx/超时�
 
 RedisBreaker = 共享态主路 + 进程内备胎（同一状态机的 MemoryBreaker，每次上报双写，始终带着本进程的近期失败史）。
 Redis 任一触点异常即降级，且降级粘滞：之后 probe_interval 内判定与上报只走备胎、不碰 Redis；顺路探针只在 allow 领
-（上报路径降级期直接跳过 Redis，否则多个触点会互相续期、恢复时机不可预测），触点失败一律顺延窗口，探针成功即切回并记日志。
+（上报路径降级期直接跳过 Redis，否则多个触点会互相续期、恢复时机不可预测），触点失败一律顺延窗口；只有被指派的那次探针
+成功才切回并记日志——健康期发出、降级后才返回的迟到成功只返回自己的裁决，不改状态（否则故障瞬间在途的响应会把状态翻来翻去）。
 降级期承诺退化：全集群单探针失效（每副本各探一个）、备胎只看得见本进程的上报；不降级的是熔断能力本身。
 """
 
@@ -168,6 +169,10 @@ class RedisBreaker:
         self._degraded = False
         self._degraded_until = 0.0  # 单调时刻：此前不碰 Redis
 
+    @property
+    def degraded(self) -> bool:
+        return self._degraded
+
     @staticmethod
     def _keys(key: str) -> tuple[str, str, str]:
         base = f"{KEY_PREFIX}:{key}"
@@ -202,8 +207,11 @@ class RedisBreaker:
 
     async def allow(self, key: str) -> Decision:
         """放行判定：allow = 正常 / probe = 你是全集群唯一的试探 / deny = 秒拒。降级期由备胎裁决。"""
-        if self._degraded and not self._probe_due():
-            return await self._local.allow(key)
+        probing = False
+        if self._degraded:
+            if not self._probe_due():
+                return await self._local.allow(key)
+            probing = True  # 只有领到探针的这次调用才有资格恢复
         try:
             decision = await self._allow_redis(key)
         except Exception:
@@ -212,7 +220,7 @@ class RedisBreaker:
                     u.LOG_BREAKER_DEGRADED, breaker=key, op="allow", exc_info=True
                 )
             return await self._local.allow(key)
-        if self._degraded:
+        if probing:
             self._note_recovered(key)
         return decision
 
