@@ -1,4 +1,5 @@
-"""入口冒烟：healthz 契约；lifespan 在 fake 模式下建起共享件，按租户装配的网关能流出回复并落账。"""
+"""入口冒烟：healthz 契约；lifespan 在 fake 模式下建起共享件，按租户装配的网关能流出回复并落账；
+入站限流器随 lifespan 建起并挂到 app.state、关停后摘下（M1.6）。"""
 
 import httpx
 import pytest
@@ -48,3 +49,48 @@ async def test_lifespan_builds_gateway_parts_in_fake_mode(
 
 def test_lifespan_is_registered():
     assert app.router.lifespan_context is not None
+
+
+async def test_lifespan_mounts_inbound_limiter_and_unmounts_on_shutdown(
+    monkeypatch, redis_db1, pg_test_db, namespace
+):
+    pytest.importorskip(
+        "app.core.limits", reason="M1.6 未敲：app/core/limits.py 不存在"
+    )
+    from app.core.config import get_settings
+    from app.core.limits import InboundLimiter, limiter_of
+
+    monkeypatch.setenv("REDIS_URL", redis_db1)
+    monkeypatch.setenv("DATABASE_URL", pg_test_db)
+    monkeypatch.setenv("AEGIS_FAKE_LLM", "1")
+    get_settings.cache_clear()
+    try:
+        async with app.router.lifespan_context(app):
+            limiter = limiter_of(app)
+            assert isinstance(limiter, InboundLimiter) and not limiter.degraded
+            key = limiter.key("tenant:tA", namespace)
+            assert await limiter.check(key, 1, 60_000) == 0  # 脚本已预载：真计数
+            assert await limiter.check(key, 1, 60_000) > 0
+        assert limiter_of(app) is None  # 关停：摘闸 → fail-open
+    finally:
+        get_settings.cache_clear()
+        structlog.reset_defaults()
+
+
+async def test_lifespan_without_redis_mounts_nothing(monkeypatch, pg_test_db):
+    pytest.importorskip(
+        "app.core.limits", reason="M1.6 未敲：app/core/limits.py 不存在"
+    )
+    from app.core.config import get_settings
+    from app.core.limits import limiter_of
+
+    monkeypatch.setenv("REDIS_URL", "")
+    monkeypatch.setenv("DATABASE_URL", pg_test_db)
+    monkeypatch.setenv("AEGIS_FAKE_LLM", "1")
+    get_settings.cache_clear()
+    try:
+        async with app.router.lifespan_context(app):
+            assert limiter_of(app) is None  # 无 Redis 配置 = 入站限流永远 fail-open
+    finally:
+        get_settings.cache_clear()
+        structlog.reset_defaults()

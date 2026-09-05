@@ -2,7 +2,7 @@
 
 异常消息与告警文案只在这里定义，其它模块只引用常量；带 {} 占位符的用 str.format 填充。
 按消费步骤分组（M1.1 只用到"异常翻译"一组，其余为后续步骤预留的同一份事实源）。
-登记例外（计划 §7）：domain/usage.py 的价目表告警串、core/limits.py 的 429 串、core/config.py 的 prod 禁注入串
+登记例外（计划 §7）：domain/usage.py 的价目表告警串、core/limits.py 的 429 串与降级/恢复告警串、core/config.py 的 prod 禁注入串
 ——分层契约不许 domain/core 反向 import engine。
 """
 

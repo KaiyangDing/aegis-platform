@@ -89,6 +89,8 @@ class Settings(BaseSettings):
     cache_ttl_seconds: int = Field(default=300, ge=0)  # 0 = 关缓存（组合根不装）
     # 缓存降级期顺路探针间隔：Redis 断后每隔这么久才再碰一次（与熔断同款粘滞）
     cache_probe_interval_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    # --- 入站限流（M1.6；ADR-010）：阈值由端点挂载处给（M3），这里只有降级期顺路探针间隔 ---
+    inbound_probe_interval_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     fault_injection_rate: float = Field(default=0.0, ge=0.0, le=1.0)  # 0 = 关闭
     fault_injection_targets: list[str] = []  # 点名 "provider:model"
     fault_injection_mode: Literal["error", "hang", "midstream"] = "error"
