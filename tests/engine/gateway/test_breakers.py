@@ -28,6 +28,11 @@ FAST = BreakerPolicy(
 FORGET = BreakerPolicy(
     fail_max=FAIL_MAX, reset_timeout=0.2, probe_ttl=0.2, fail_window=0.8
 )
+# 备胎热态断言用：open 窗放宽到 2s——首次降级的 warning 带 exc_info，dev 模式 structlog 渲染
+# traceback 约 0.4s，比 FAST 的 0.2s open 窗还长，备胎会在被问到之前先半开（2026-09-05 修复的假红）
+WARM = BreakerPolicy(
+    fail_max=FAIL_MAX, reset_timeout=2.0, probe_ttl=0.2, fail_window=3.0
+)
 KEY = "p:m"
 
 
@@ -483,7 +488,7 @@ async def test_recovery_switches_back_to_redis(flaky, key, clock, redis_async):
 
 async def test_local_fallback_is_warm(flaky, key):
     """双写：主路健康时备胎也在记账，Redis 一断就接手，不必重新攒失败。"""
-    b = RedisBreaker(flaky, FAST)
+    b = RedisBreaker(flaky, WARM)
     await fail(b, key, FAIL_MAX)  # 走 Redis，同时进备胎
     assert await b.allow(key) == "deny"
     flaky.dead = True

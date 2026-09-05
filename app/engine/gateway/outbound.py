@@ -1,4 +1,4 @@
-"""出站闸：每 provider 一个 InMemoryRateLimiter，限时取令牌（ADR-008 出站部分）。
+"""出站闸：每 key 一个 InMemoryRateLimiter，限时取令牌（ADR-008）。key = provider（供应商闸）或 tenant_id（租户桶）。
 
 四约束（登记表）：进程内（多副本口径 = 全局 / 副本数）；按次数不按 token；初始 0 令牌——这里预填 burst
 恢复 v1 的冷启动满桶；acquire 内嵌于 BaseChatModel.astream——所以不挂候选 rate_limiter=，由候选环经
@@ -6,10 +6,12 @@ complete_with_retry 的 acquire 缝在首块计时器之外显式限时取令牌
 库无 max_wait/不换路/无等待预估：等待预算与"等不到就不等"的预判（v1 wait_take 语义）都是自建的——
 按桶的补给模型算出下一枚令牌何时够，超出预算直接放弃，不白烧预算；预算内按 check_every 轮询、
 到期前至少再试一次（不受库 blocking=True 的轮询粒度地板约束）。
+租户桶（ADR-008 决策 4，A′）：按 tenant_id 惰性创建，max_keys 有界 LRU——淘汰再回来的租户从满桶重新开始（近似，记账）。
 """
 
 import asyncio
 import time
+from collections import OrderedDict
 
 from langchain_core.rate_limiters import InMemoryRateLimiter
 
@@ -19,7 +21,7 @@ _monotonic = time.monotonic  # 测试接缝
 
 
 class ProviderLimiter:
-    """实现 LimiterLike。key = provider。"""
+    """实现 LimiterLike。"""
 
     def __init__(
         self,
@@ -28,15 +30,23 @@ class ProviderLimiter:
         burst: float,
         max_wait: float,
         check_every_n_seconds: float = 0.02,
+        max_keys: int | None = None,
     ) -> None:
         # burst < 1 时库永远发不出令牌（要求 available_tokens >= 1）：启动即炸，别做成永久拒绝
-        if rate <= 0 or burst < 1 or max_wait < 0 or check_every_n_seconds <= 0:
+        if (
+            rate <= 0
+            or burst < 1
+            or max_wait < 0
+            or check_every_n_seconds <= 0
+            or (max_keys is not None and max_keys < 1)
+        ):
             raise ValueError(u.OUTBOUND_LIMITER_INVALID)
         self._rate = rate
         self._burst = burst
         self._max_wait = max_wait
         self._check_every = check_every_n_seconds
-        self._buckets: dict[str, InMemoryRateLimiter] = {}
+        self._max_keys = max_keys
+        self._buckets: OrderedDict[str, InMemoryRateLimiter] = OrderedDict()
 
     def _bucket(self, key: str) -> InMemoryRateLimiter:
         bucket = self._buckets.get(key)
@@ -50,6 +60,10 @@ class ProviderLimiter:
                 self._burst
             )  # 冷启动满桶：允许合理的开局突发（v1 语义）
             self._buckets[key] = bucket
+            if self._max_keys is not None and len(self._buckets) > self._max_keys:
+                self._buckets.popitem(last=False)  # 最久未用的 key 出局
+        else:
+            self._buckets.move_to_end(key)
         return bucket
 
     @staticmethod

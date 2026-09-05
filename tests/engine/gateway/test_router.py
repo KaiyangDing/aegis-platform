@@ -55,6 +55,7 @@ def make_gw(
     breaker = breaker or StubBreaker()
     limiter = limiter or StubLimiter()
     gw = AegisGateway(
+        tenant_id="t1",  # M1.5a 起必填：租户身份在构造时绑定
         routes={tier: [cand(n) for n in named]},
         models={cand(n): m for n, m in named.items()},
         breaker=breaker,
@@ -481,6 +482,7 @@ def test_sync_invoke_is_unsupported():
 async def test_default_tier_and_bind_override():
     pf, ps = scripted(ok()), scripted(ok())
     gw = AegisGateway(
+        tenant_id="t1",
         routes={"fast": [cand("pf")], "standard": [cand("ps")]},
         models={cand("pf"): pf, cand("ps"): ps},
         breaker=StubBreaker(),

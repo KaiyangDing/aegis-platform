@@ -1,19 +1,38 @@
-"""全仓 fixture：真 Redis db1（熔断/缓存/限流测试），不可达则整组跳过并给出启动命令。
+"""全仓 fixture：真 Redis db1（熔断/缓存/限流测试）与真 Postgres 测试库 aegis_test（账本/迁移测试），
+不可达则整组跳过并给出启动命令。
 
 flushdb 是全仓唯一的破坏性触点，且只许清 db1（fixture 里断言）。
+测试库由 alembic downgrade base → upgrade head 建表（迁移=被测物，不用 create_all）；
+每测一个引擎（asyncpg 连接绑定事件循环，探针⑰）+ 外层连接事务 + create_savepoint 会话工厂：
+被测组件"自己开会话自己 commit"，外层 rollback 一笔勾销，测试库零污染。
 """
 
+import asyncio
 import socket
 import uuid
+from pathlib import Path
 
+import asyncpg
 import pytest
 import redis
 import redis.asyncio as aioredis
+from alembic import command
+from alembic.config import Config
 from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
+from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
+ROOT = Path(__file__).resolve().parents[1]
 REDIS_TEST_URL = "redis://127.0.0.1:6379/1"
 DEAD_REDIS_URL = "redis://127.0.0.1:6390/1"
+PG_TEST_DB = "aegis_test"
+PG_TEST_URL = f"postgresql+asyncpg://aegis:aegis_dev_pw@127.0.0.1:5432/{PG_TEST_DB}"
+PG_ADMIN_DSN = "postgresql://aegis:aegis_dev_pw@127.0.0.1:5432/aegis"
 
 
 @pytest.fixture(scope="session")
@@ -66,3 +85,64 @@ async def dead_redis_async() -> aioredis.Redis:
 @pytest.fixture
 def namespace() -> str:
     return f"t{uuid.uuid4().hex[:8]}"
+
+
+# ---------------------------------------------------------------- Postgres 测试库
+
+
+async def _ensure_test_database() -> None:
+    conn = await asyncpg.connect(PG_ADMIN_DSN, timeout=2.0)
+    try:
+        exists = await conn.fetchval(
+            "SELECT 1 FROM pg_database WHERE datname = $1", PG_TEST_DB
+        )
+        if not exists:
+            await conn.execute(f"CREATE DATABASE {PG_TEST_DB}")
+    finally:
+        await conn.close()
+
+
+@pytest.fixture(scope="session")
+def pg_test_db() -> str:
+    """会话级：探活 + 建库 + 迁移从零跑到 head（同步夹具里 asyncio.run，与各测试的事件循环无关）。"""
+    pytest.importorskip(
+        "app.domain.usage", reason="M1.5b 未敲：app/domain/usage.py 不存在"
+    )
+    try:
+        asyncio.run(_ensure_test_database())
+    except OSError, asyncpg.PostgresError, TimeoutError:
+        pytest.skip("Postgres 不可达：docker compose up -d postgres")
+    cfg = Config(str(ROOT / "alembic.ini"))
+    cfg.set_main_option("sqlalchemy.url", PG_TEST_URL)
+    command.downgrade(cfg, "base")
+    command.upgrade(cfg, "head")
+    return PG_TEST_URL
+
+
+@pytest.fixture
+async def db_conn(pg_test_db: str) -> AsyncConnection:
+    """一条带外层事务的连接：测试里发生的一切在结束时整体回滚。引擎每测新建（跨 loop 不可复用）。"""
+    engine = create_async_engine(pg_test_db)
+    async with engine.connect() as conn:
+        trans = await conn.begin()
+        yield conn
+        await trans.rollback()  # 一笔勾销
+    await engine.dispose()
+
+
+@pytest.fixture
+def db_session_factory(db_conn: AsyncConnection) -> async_sessionmaker[AsyncSession]:
+    """绑在测试连接上的会话工厂：给"自己开会话自己 commit"的组件（记账员）注入。
+
+    join_transaction_mode="create_savepoint"：这些会话的 commit 只提交 SAVEPOINT，
+    外层 rollback 照样把一切吞掉——被测组件真实提交，测试库零污染。
+    """
+    return async_sessionmaker(
+        bind=db_conn, join_transaction_mode="create_savepoint", expire_on_commit=False
+    )
+
+
+@pytest.fixture
+async def db_session(db_session_factory) -> AsyncSession:
+    async with db_session_factory() as session:
+        yield session

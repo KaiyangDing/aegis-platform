@@ -19,7 +19,9 @@ class Settings(BaseSettings):
     checkpoint_database_url: str = (
         "postgresql://aegis:aegis_dev_pw@127.0.0.1:5432/aegis"
     )
-    redis_url: str = "redis://127.0.0.1:6379/0"
+    redis_url: str = (
+        "redis://127.0.0.1:6379/0"  # 空串 = 无 Redis（熔断退化进程内、缓存关闭）
+    )
 
     # --- 上游供应商与档位路由（M1.2） ---
     dashscope_api_key: SecretStr = SecretStr("")
@@ -39,6 +41,9 @@ class Settings(BaseSettings):
     aegis_fake_llm: bool = True
     # 线 B：fake 首块前延迟，让任务时长与队列形态接近真实（0 = 瞬间完成，什么都压不出来）
     aegis_fake_llm_delay_s: float = Field(default=0.0, ge=0)
+    # 共享上游 httpx2 客户端的连接池：池满等 pool 超时即 GatewayOverloadedError（本地过载，不换路不进账）
+    upstream_max_connections: int = Field(default=100, gt=0)
+    upstream_max_keepalive: int = Field(default=20, ge=0)
 
     # --- 熔断与出站闸（M1.4b；v1 口径起点，参数重推见 ADR-007/008） ---
     breaker_fail_max: int = Field(default=5, gt=0)  # 连续入账失败达到即开路
@@ -58,8 +63,32 @@ class Settings(BaseSettings):
         default=10.0, ge=0
     )  # 取令牌最长排队；0 = 只试不排
 
+    # --- 租户配额与预算（M1.5c；ADR-008 决策 3/4） ---
+    tenant_rate_per_s: float = Field(default=5.0, gt=0)  # 每租户出站速率（进程内近似）
+    tenant_burst: float = Field(default=10.0, ge=1)
+    tenant_limiter_max_keys: int = Field(default=10_000, ge=1)  # 租户桶 LRU 上限
+    tenant_monthly_token_budget: int = Field(
+        default=0, ge=0
+    )  # 0 = 关闭；超额抛 BudgetExceeded
+    request_token_budget: int = Field(
+        default=0, ge=0
+    )  # 单请求估算预算（自家尺）；0 = 关闭
+
+    # --- 计量（M1.5b） ---
+    # 模型单价（元/千 token，[输入, 输出]）——演示值，以百炼价目页为准；调价改这里不改代码。
+    # 组合根经 domain.usage.price_table 转 Decimal(str(p))；不在价目表的模型记 0 并告警。
+    model_prices: dict[str, list[float]] = {
+        "qwen-flash": [0.00015, 0.0015],
+        "qwen-turbo": [0.0003, 0.0006],
+        "qwen-plus": [0.0008, 0.002],
+        "qwen3.7-max": [0.012, 0.036],
+        "text-embedding-v4": [0.0005, 0.0],
+    }
+
     # --- 缓存与故障注入 ---
     cache_ttl_seconds: int = Field(default=300, ge=0)  # 0 = 关缓存（组合根不装）
+    # 缓存降级期顺路探针间隔：Redis 断后每隔这么久才再碰一次（与熔断同款粘滞）
+    cache_probe_interval_s: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     fault_injection_rate: float = Field(default=0.0, ge=0.0, le=1.0)  # 0 = 关闭
     fault_injection_targets: list[str] = []  # 点名 "provider:model"
     fault_injection_mode: Literal["error", "hang", "midstream"] = "error"
@@ -71,6 +100,16 @@ class Settings(BaseSettings):
         # 注入器是演示/实验专用：生产环境配置了注入率，进程启动即炸，不许带病上线
         if self.app_env == "prod" and self.fault_injection_rate > 0:
             raise ValueError("生产环境禁止故障注入：FAULT_INJECTION_RATE 必须为 0")
+        return self
+
+    @model_validator(mode="after")
+    def _prices_are_pairs(self) -> Settings:
+        # 价目表形态在启动时钉死：[输入, 输出] 两项非负——环境变量 JSON 写错不许拖到第一笔账
+        for model, pair in self.model_prices.items():
+            if len(pair) != 2 or any(p < 0 for p in pair):
+                raise ValueError(
+                    f"MODEL_PRICES 非法：{model} 须为 [输入价, 输出价] 且非负"
+                )
         return self
 
 

@@ -69,6 +69,7 @@ def gateway(
 ) -> tuple[AegisGateway, RecordingBreaker]:
     breaker = RecordingBreaker(fail_max=fail_max)
     gw = AegisGateway(
+        tenant_id="t1",  # M1.5a 起必填：租户身份在构造时绑定
         routes={"fast": [C1, C2]},
         models={C1: p1, C2: p2},
         breaker=breaker,

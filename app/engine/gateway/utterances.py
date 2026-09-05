@@ -2,6 +2,8 @@
 
 异常消息与告警文案只在这里定义，其它模块只引用常量；带 {} 占位符的用 str.format 填充。
 按消费步骤分组（M1.1 只用到"异常翻译"一组，其余为后续步骤预留的同一份事实源）。
+登记例外（计划 §7）：domain/usage.py 的价目表告警串、core/limits.py 的 429 串、core/config.py 的 prod 禁注入串
+——分层契约不许 domain/core 反向 import engine。
 """
 
 # --- 异常翻译（M1.1 errors.classify） ---
@@ -44,13 +46,16 @@ TENANT_QUOTA = "租户 {tenant_id} 出站配额耗尽"
 TENANT_ID_INVALID = "tenant_id 非法：只允许 [A-Za-z0-9_-]{{1,64}}"
 
 # --- 告警文案（logger.warning 的 event） ---
-LOG_PRICE_MISSING = "模型不在价目表中，本行成本记 0（请尽快补配置）"
 LOG_METER_WRITE_FAILED = "计量写入失败（对账脚本会暴露此缺口）"
 LOG_BUDGET_READ_FAILED = "预算读取失败，本次放行（fail-open）"
 LOG_CACHE_DEGRADED = "精确缓存不可用，降级为直通"
 LOG_CACHE_RECOVERED = "精确缓存恢复，切回缓存路径"
+LOG_CACHE_DIRTY = "缓存条目损坏，已删除并按 miss 处理"
+CACHE_PARAMS_INVALID = "缓存参数非法：ttl_seconds > 0，probe_interval > 0"
 LOG_BREAKER_STATE_CHANGED = "熔断器状态变化"
-OUTBOUND_LIMITER_INVALID = "出站闸参数非法：rate/burst 须 > 0，max_wait 须 ≥ 0"
+OUTBOUND_LIMITER_INVALID = (
+    "出站闸参数非法：rate/burst 须 > 0，max_wait 须 ≥ 0，max_keys 须 ≥ 1"
+)
 BREAKER_POLICY_INVALID = "熔断参数非法：fail_max ≥ 1，四个时长为有限正数，fail_window > reset_timeout + probe_ttl"
 LOG_BREAKER_DEGRADED = "熔断存储不可用，降级为进程内状态机（粘滞 probe_interval；全集群单探针在降级期失效）"
 LOG_BREAKER_RECOVERED = "熔断存储恢复，切回共享态"

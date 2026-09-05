@@ -134,6 +134,7 @@ def test_injector_cache_is_off():
 def gateway(models, **kw):
     breaker = StubBreaker()
     gw = AegisGateway(
+        tenant_id="t1",  # M1.5a 起必填
         routes={"fast": [C1, C2]},
         models=models,
         breaker=breaker,
