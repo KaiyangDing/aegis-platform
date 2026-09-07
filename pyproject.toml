@@ -69,3 +69,9 @@ type = "forbidden"
 source_modules = ["app.domain"]
 forbidden_modules = ["app.engine", "app.routers"]
 
+[[tool.importlinter.contracts]]
+name = "gateway 不依赖 runtime"
+type = "forbidden"
+source_modules = ["app.engine.gateway"]
+forbidden_modules = ["app.engine.runtime"]
+

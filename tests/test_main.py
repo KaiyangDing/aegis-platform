@@ -7,6 +7,7 @@ import structlog
 from langchain_core.messages import HumanMessage
 
 from app.main import app
+from tests.conftest import PG_TEST_DSN
 
 
 async def test_healthz_ok():
@@ -31,6 +32,7 @@ async def test_lifespan_builds_gateway_parts_in_fake_mode(
 
     monkeypatch.setenv("REDIS_URL", redis_db1)
     monkeypatch.setenv("DATABASE_URL", pg_test_db)
+    monkeypatch.setenv("CHECKPOINT_DATABASE_URL", PG_TEST_DSN)
     monkeypatch.setenv("AEGIS_FAKE_LLM", "1")
     get_settings.cache_clear()
     try:
@@ -62,6 +64,7 @@ async def test_lifespan_mounts_inbound_limiter_and_unmounts_on_shutdown(
 
     monkeypatch.setenv("REDIS_URL", redis_db1)
     monkeypatch.setenv("DATABASE_URL", pg_test_db)
+    monkeypatch.setenv("CHECKPOINT_DATABASE_URL", PG_TEST_DSN)
     monkeypatch.setenv("AEGIS_FAKE_LLM", "1")
     get_settings.cache_clear()
     try:
@@ -86,6 +89,7 @@ async def test_lifespan_without_redis_mounts_nothing(monkeypatch, pg_test_db):
 
     monkeypatch.setenv("REDIS_URL", "")
     monkeypatch.setenv("DATABASE_URL", pg_test_db)
+    monkeypatch.setenv("CHECKPOINT_DATABASE_URL", PG_TEST_DSN)
     monkeypatch.setenv("AEGIS_FAKE_LLM", "1")
     get_settings.cache_clear()
     try:
@@ -94,3 +98,72 @@ async def test_lifespan_without_redis_mounts_nothing(monkeypatch, pg_test_db):
     finally:
         get_settings.cache_clear()
         structlog.reset_defaults()
+
+
+async def test_lifespan_mounts_checkpointer_and_closes_pool(monkeypatch, pg_test_db):
+    """M2.2：checkpointer 随 lifespan 开池 + 框架迁移，挂 app.state；关停摘下并关池（之后 PoolClosed）。"""
+    pytest.importorskip(
+        "app.core.checkpoint", reason="M2.2 未敲：app/core/checkpoint.py 不存在"
+    )
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    from psycopg_pool import PoolClosed
+
+    from app.core.config import get_settings
+
+    monkeypatch.setenv("REDIS_URL", "")
+    monkeypatch.setenv("DATABASE_URL", pg_test_db)
+    monkeypatch.setenv("CHECKPOINT_DATABASE_URL", PG_TEST_DSN)
+    monkeypatch.setenv("AEGIS_FAKE_LLM", "1")
+    get_settings.cache_clear()
+    try:
+        async with app.router.lifespan_context(app):
+            saver = app.state.checkpointer
+            assert isinstance(saver, AsyncPostgresSaver)
+            cfg = {"configurable": {"thread_id": f"lifespan-{namespace_hex()}"}}
+            assert await saver.aget_tuple(cfg) is None  # 池已开、表已建：真查询
+        assert app.state.checkpointer is None
+        with pytest.raises(PoolClosed):
+            await saver.aget_tuple(cfg)
+    finally:
+        get_settings.cache_clear()
+        structlog.reset_defaults()
+
+
+async def test_lifespan_mounts_agent_runtime(monkeypatch, pg_test_db):
+    """M2.3：AgentRuntime 随 lifespan 装配挂 app.state.runtime，关停摘下。"""
+    pytest.importorskip(
+        "app.engine.runtime.runtime",
+        reason="M2.3 未敲：app/engine/runtime/runtime.py 不存在",
+    )
+    from app import main as main_mod
+    from app.core.config import get_settings
+    from app.engine.runtime.runtime import AgentRuntime
+    from app.engine.runtime.spec import AgentSpec
+
+    if not hasattr(main_mod, "build_runtime"):
+        pytest.skip("M2.3 未敲：main.py 尚未装配 runtime")
+    monkeypatch.setenv("REDIS_URL", "")
+    monkeypatch.setenv("DATABASE_URL", pg_test_db)
+    monkeypatch.setenv("CHECKPOINT_DATABASE_URL", PG_TEST_DSN)
+    monkeypatch.setenv("AEGIS_FAKE_LLM", "1")
+    get_settings.cache_clear()
+    try:
+        async with app.router.lifespan_context(app):
+            runtime = app.state.runtime
+            assert isinstance(runtime, AgentRuntime)
+            assert (
+                "model"
+                in runtime.build_agent("tA", AgentSpec(system_prompt="演示"))
+                .get_graph()
+                .nodes
+            )
+        assert app.state.runtime is None
+    finally:
+        get_settings.cache_clear()
+        structlog.reset_defaults()
+
+
+def namespace_hex() -> str:
+    import uuid
+
+    return uuid.uuid4().hex

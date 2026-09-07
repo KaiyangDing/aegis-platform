@@ -1,10 +1,12 @@
-"""全仓 fixture：真 Redis db1（熔断/缓存/限流测试）与真 Postgres 测试库 aegis_test（账本/迁移测试），
+"""全仓 fixture：真 Redis db1（熔断/缓存/限流测试）与真 Postgres 测试库 aegis_test（账本/迁移/事件/checkpointer 测试），
 不可达则整组跳过并给出启动命令。
 
 flushdb 是全仓唯一的破坏性触点，且只许清 db1（fixture 里断言）。
 测试库由 alembic downgrade base → upgrade head 建表（迁移=被测物，不用 create_all）；
+LangGraph checkpointer 的四张框架表不归 alembic：每个测试会话开局整体删掉，由 setup() 重建（M2.2）。
 每测一个引擎（asyncpg 连接绑定事件循环，探针⑰）+ 外层连接事务 + create_savepoint 会话工厂：
 被测组件"自己开会话自己 commit"，外层 rollback 一笔勾销，测试库零污染。
+事件循环：全仓统一 Selector（pytest_asyncio_loop_factories 钩子）——psycopg 拒绝 Windows 的 Proactor（ADR-011 决策 9）。
 """
 
 import asyncio
@@ -32,7 +34,19 @@ REDIS_TEST_URL = "redis://127.0.0.1:6379/1"
 DEAD_REDIS_URL = "redis://127.0.0.1:6390/1"
 PG_TEST_DB = "aegis_test"
 PG_TEST_URL = f"postgresql+asyncpg://aegis:aegis_dev_pw@127.0.0.1:5432/{PG_TEST_DB}"
+PG_TEST_DSN = f"postgresql://aegis:aegis_dev_pw@127.0.0.1:5432/{PG_TEST_DB}"  # psycopg 形态（checkpointer）
 PG_ADMIN_DSN = "postgresql://aegis:aegis_dev_pw@127.0.0.1:5432/aegis"
+FRAMEWORK_TABLES: tuple[str, ...] = (
+    "checkpoint_writes",
+    "checkpoint_blobs",
+    "checkpoints",
+    "checkpoint_migrations",
+)
+
+
+def pytest_asyncio_loop_factories(config, item):
+    """全仓统一 Selector 循环（Linux 默认即此；Windows 由此绕开 Proactor）。单一工厂时 pytest 不改测试 id。"""
+    return {"selector": asyncio.SelectorEventLoop}
 
 
 @pytest.fixture(scope="session")
@@ -102,18 +116,35 @@ async def _ensure_test_database() -> None:
         await conn.close()
 
 
+async def _reset_schema() -> None:
+    """测试库从零开始：整个 public schema 重建。
+
+    两个理由：checkpointer 四表不归 alembic（由 setup() 重建，thread 间靠唯一 id 隔离）；
+    库里的 alembic_version 可能指向当前代码树还没有的迁移（稿件先于手敲落库），downgrade 会因找不到修订而炸。
+    """
+    conn = await asyncpg.connect(PG_TEST_DSN, timeout=2.0)
+    try:
+        await conn.execute("DROP SCHEMA public CASCADE")
+        await conn.execute("CREATE SCHEMA public")
+    finally:
+        await conn.close()
+
+
 @pytest.fixture(scope="session")
 def pg_test_db() -> str:
-    """会话级：探活 + 建库 + 迁移从零跑到 head（同步夹具里 asyncio.run，与各测试的事件循环无关）。"""
+    """会话级：探活 + 建库 + 清 schema + 迁移到 head，再 downgrade base / upgrade head 走一遍降级脚本
+    （同步夹具里 asyncio.run，与各测试的事件循环无关）。"""
     pytest.importorskip(
         "app.domain.usage", reason="M1.5b 未敲：app/domain/usage.py 不存在"
     )
     try:
         asyncio.run(_ensure_test_database())
+        asyncio.run(_reset_schema())
     except OSError, asyncpg.PostgresError, TimeoutError:
         pytest.skip("Postgres 不可达：docker compose up -d postgres")
     cfg = Config(str(ROOT / "alembic.ini"))
     cfg.set_main_option("sqlalchemy.url", PG_TEST_URL)
+    command.upgrade(cfg, "head")
     command.downgrade(cfg, "base")
     command.upgrade(cfg, "head")
     return PG_TEST_URL
@@ -132,7 +163,7 @@ async def db_conn(pg_test_db: str) -> AsyncConnection:
 
 @pytest.fixture
 def db_session_factory(db_conn: AsyncConnection) -> async_sessionmaker[AsyncSession]:
-    """绑在测试连接上的会话工厂：给"自己开会话自己 commit"的组件（记账员）注入。
+    """绑在测试连接上的会话工厂：给"自己开会话自己 commit"的组件（记账员 / 事件存取）注入。
 
     join_transaction_mode="create_savepoint"：这些会话的 commit 只提交 SAVEPOINT，
     外层 rollback 照样把一切吞掉——被测组件真实提交，测试库零污染。
@@ -146,3 +177,25 @@ def db_session_factory(db_conn: AsyncConnection) -> async_sessionmaker[AsyncSess
 async def db_session(db_session_factory) -> AsyncSession:
     async with db_session_factory() as session:
         yield session
+
+
+@pytest.fixture
+async def pg_checkpointer(pg_test_db: str):
+    """每测一个 checkpointer（psycopg 池绑定事件循环）：开池 + 框架迁移；关停关池。
+
+    checkpoint 写入走框架自己的连接与 autocommit，不在回滚夹具内——测试用唯一 thread_id 互不干扰，
+    表在下个会话开局整体删除。
+    """
+    pytest.importorskip(
+        "app.core.checkpoint", reason="M2.2 未敲：app/core/checkpoint.py 不存在"
+    )
+    from app.core.checkpoint import (
+        close_checkpointer,
+        make_checkpointer,
+        open_checkpointer,
+    )
+
+    saver = make_checkpointer(PG_TEST_DSN, pool_size=2)
+    await open_checkpointer(saver)
+    yield saver
+    await close_checkpointer(saver)

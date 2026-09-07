@@ -23,6 +23,7 @@ from app.domain.usage import (
     price_table,
 )
 from app.engine.gateway.protocols import MeterLike
+from tests.conftest import FRAMEWORK_TABLES
 
 PRICES: PriceTable = {"qwen-flash": (Decimal("0.00015"), Decimal("0.0015"))}
 
@@ -108,11 +109,19 @@ async def test_rollback_isolation_second(db_session):
     await db_session.flush()
 
 
+def _not_framework_table(obj, name, type_, reflected, compare_to) -> bool:
+    """LangGraph checkpointer 四表由框架 setup() 自管、不进 alembic（ADR-011）：漂移检查按名跳过。"""
+    return not (type_ == "table" and name in FRAMEWORK_TABLES)
+
+
 async def test_migration_matches_orm_metadata(db_conn):
-    """迁移是被测物：手写的 0001 与 ORM 元数据零漂移（列/类型/索引）。"""
+    """迁移是被测物：手写的迁移与 ORM 元数据零漂移（列/类型/索引），全部业务表一起比。"""
 
     def diff(sync_conn):
-        return compare_metadata(MigrationContext.configure(sync_conn), Base.metadata)
+        ctx = MigrationContext.configure(
+            sync_conn, opts={"include_object": _not_framework_table}
+        )
+        return compare_metadata(ctx, Base.metadata)
 
     assert await db_conn.run_sync(diff) == []
 
