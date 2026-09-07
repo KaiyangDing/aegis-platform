@@ -1,4 +1,4 @@
-"""L2 运行时：注入面（AgentSpec / ToolDef）、事件事实、话术。不被 gateway import（import-linter 第四条契约）。"""
+"""L2 运行时：注入面（AgentSpec / ToolDef）、事件事实、话术、跨包协议。不被 gateway import（import-linter 第四条契约）。"""
 
 from app.engine.runtime.events import (
     EVENT_ID_NAMESPACE,
@@ -9,7 +9,12 @@ from app.engine.runtime.events import (
     normalize_event,
     normalize_events,
 )
-from app.engine.runtime.protocols import EventSink
+from app.engine.runtime.protocols import (
+    EventSink,
+    EventSource,
+    SessionRunState,
+    SessionStateLike,
+)
 from app.engine.runtime.spec import (
     TERMINATION_GATES,
     AgentSpec,
@@ -37,9 +42,12 @@ __all__ = [
     "AgentSpec",
     "ContextConfig",
     "EventSink",
+    "EventSource",
     "EventType",
     "LoopPolicy",
     "RiskPolicy",
+    "SessionRunState",
+    "SessionStateLike",
     "SideEffect",
     "SubAgentPolicy",
     "TerminationReason",
