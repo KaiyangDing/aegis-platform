@@ -49,6 +49,11 @@ class EventSource(Protocol):
     ) -> list[dict[str, Any]]: ...
 
 
+@runtime_checkable
+class EventStoreLike(EventSink, EventSource, Protocol):
+    """门面要的完整事实源：既写又读（domain 的 EventStore 同时满足两者）。"""
+
+
 class SessionRunState(StrEnum):
     """sessions.run_state 的四个值（domain 侧 RUN_STATES 与之同值，测试互钉）。
 
