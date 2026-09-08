@@ -1,5 +1,5 @@
 """工具契约（契约 C7）：ToolDef（工具的完整说明书）、ToolContext（运行时注入的身份）、@tool 装饰器、
-ToolRegistry，以及 ToolDef → 框架 StructuredTool 的载体转换。
+ToolRegistry、执行结局 OutcomeKind / ToolOutcome（M2.5），以及 ToolDef → 框架 StructuredTool 的载体转换。
 
 核心安全分野：LLM 只能提供业务参数（order_id 这类"查询条件"），身份（tenant_id / user_id）由运行时注入 ctx、
 模型不可控——水平越权的第一道防线在类型签名上就成立。
@@ -61,6 +61,28 @@ RiskPolicy = Callable[[Any, Mapping[str, Any]], bool]
 """风险闸门谓词：(已校验的工具参数, 租户配置) -> 是否需要 HITL 审批。
 参数的真实类型是装饰器为各工具生成的 args 模型，运行时无法静态枚举，故 Any。
 谓词自身崩溃 = 阻断（fail-closed，M2.5 / M2.7 消费）。"""
+
+
+class OutcomeKind(StrEnum):
+    """工具调用的五种结局（v1 逐字）。值进 ToolMessage.status 的映射与测试断言，快照钉死。"""
+
+    OK = "ok"  # 成功：结果已入事件流
+    ERROR = "error"  # 失败：错误文本回填给模型，它通常能自我修正
+    RESULT_UNKNOWN = "result_unknown"  # 写工具超时 / 结果不明：禁止重试话术
+    NEEDS_APPROVAL = "needs_approval"  # 风险闸门命中而无通行证：不执行（挂起由 Approvals 在 tools 之前接管，M2.7）
+    DISABLED = "disabled"  # 本轮连败禁用：改道提示
+
+
+@dataclass(frozen=True, slots=True)
+class ToolOutcome:
+    """一次工具调用的结局（ToolExec 内部值对象）。content 是回填给模型的观察结果——它是对话的一部分。"""
+
+    kind: OutcomeKind
+    tool_name: str
+    content: str
+    tool_call_id: str | None = (
+        None  # write-ahead 之后才有：事件 id（幂等键），不是模型侧 id
+    )
 
 
 @dataclass(frozen=True, slots=True)

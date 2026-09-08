@@ -1,4 +1,4 @@
-"""AgentRuntime 门面（M2.3；M2.4 插入 Gates、接取消信号）：按 (tenant_id, spec 指纹) 编译并缓存图；run() 单入口驱动一次循环、事件按 seq 序外流。
+"""AgentRuntime 门面（M2.3；M2.4 插入 Gates、接取消信号；M2.5 网关句柄进 RunContext）：按 (tenant_id, spec 指纹) 编译并缓存图；run() 单入口驱动一次循环、事件按 seq 序外流。
 
 一次 run（ADR-011 / 012）：读会话行取身份并核对租户归属 → D8 种子（历史 llm_call / llm_result 的估算字段求和）→
 T1 idle→running（CAS 失败 = 会话正忙）→ agent.astream(..., durability="sync", recursion_limit=推导, stream_mode=["custom"])
@@ -212,6 +212,9 @@ class AgentRuntime:
             sessions=self._sessions,
             token_seed=token_seed,
             cancel=cancel,
+            gateway=self._gateway_for(
+                tenant_id
+            ),  # 增强层（工具结果摘要）的 fast 档入口，与图内模型同一租户绑定
         )
         agent = self.build_agent(tenant_id, spec)
         config = {

@@ -1,11 +1,11 @@
-"""图状态私有通道 + run 载体 + 钩子内事件发射（M2.3；M2.4 加取消信号与终止辅助）。
+"""图状态私有通道 + run 载体 + 钩子内事件发射（M2.3；M2.4 加取消信号与终止辅助；M2.5 加工具健康账与网关句柄）。
 
 RunState：在框架 AgentState（messages / jump_to）之上加运行时私有通道，全部 PrivateStateAttr——不进 ainvoke 输出与 schema，
 但随 checkpoint 持久化且**跨 run 延续**（探针⑵）：run 级计数由 RunEvents.before_agent 显式归零（ADR-012 决策 8）。
 通道无 reducer、后写覆盖，且同一 superstep 只许一个写者（探针 M2.4-Q3：两个并行工具任务同时写即 InvalidUpdateError）——
-每调用一任务的 tools 节点里，只有"第一个被弃置的调用"写 termination；按工具计的连败账不能放通道（M2.5 放 RunContext）。
-RunContext：每 run 一份、不进 checkpoint 的载体（身份 / spec / 注册表 / 事实源 / 状态机 / token 种子 / 取消信号 / 工具串行器）；
-跨崩溃需要的状态只能放通道或表，不能放这里。
+每调用一任务的 tools 节点里，只有"第一个被弃置的调用"写 termination；按工具计的连败账不放通道，放 RunContext.tool_health。
+RunContext：每 run 一份、不进 checkpoint 的载体（身份 / spec / 注册表 / 事实源 / 状态机 / token 种子 / 取消信号 / 网关 /
+工具串行器 / 工具健康账）；跨崩溃需要的状态只能放通道或表，不能放这里。
 emit()：钩子内写事件的唯一入口——id 派生自 (session_id, 框架任务 id, 钩子名, 序号)，先落盘再经 stream_writer 外流；
 去重命中（重放）不再外流。
 """
@@ -17,9 +17,18 @@ from typing import Annotated, Any, NotRequired
 
 from langchain.agents.middleware import AgentState
 from langchain.agents.middleware.types import PrivateStateAttr
+from langchain_core.language_models import BaseChatModel
 from langgraph.config import get_config
 from langgraph.runtime import Runtime
 
+from app.engine.gateway.errors import (
+    BudgetExceeded,
+    GatewayExhausted,
+    GatewayOverloadedError,
+    GatewayRejected,
+    GatewayStreamInterrupted,
+    TenantQuotaExceeded,
+)
 from app.engine.runtime import utterances as u
 from app.engine.runtime.events import AgentEvent, EventType, event_id
 from app.engine.runtime.protocols import CancelSignal, EventSink, SessionStateLike
@@ -31,11 +40,28 @@ AEGIS_SOURCE = "aegis_source"
 上下文编译（M2.6）据此区分"用户原话"与"运行时注入"；框架的摘要消息用它自己的 lc_source 键。"""
 SOURCE_PROTOCOL_RETRY = "protocol_retry"
 
+INTERNAL_CALL_TAG = "aegis:internal"
+"""增强层内部 LLM 调用（工具结果摘要 / 滚动摘要）的 tag：与框架 internal_call_metadata 并用，M3 SSE 据此不转发这些块。"""
+
+GATEWAY_FAILURES = (
+    GatewayExhausted,
+    GatewayOverloadedError,
+    BudgetExceeded,
+    TenantQuotaExceeded,
+    GatewayRejected,
+    GatewayStreamInterrupted,
+)
+"""增强层（工具结果摘要 / 滚动摘要）fail-open 只接网关的六类公开异常——绝不 except GatewayError 基类：
+ProviderError 泄漏是 bug 信号，即便在增强层也要裸炸（契约 C4 的分野在增强层同样成立）。"""
+
+FAIL_STREAK_LIMIT = 2
+"""同一工具连续失败 2 次 → 本轮禁用并告知模型（v1 03 §4）。"""
+
 
 class RunState(AgentState):
     """私有通道（无 reducer：后写覆盖）。iteration = 已发起的 LLM 调用数；tokens_used = 会话级估算累计（D8 种子起）；
     violations（闸门 #5 连续违规数）/ repeat（闸门 #4 的 {key, streak}）归 Gates（M2.4）；termination 是唯一终止信号（ADR-012 决策 3）；
-    approved_calls 归审批（M2.7）；disabled_tools 归连败禁用（M2.5）。"""
+    approved_calls 是审批通行证（M2.7 由 Approvals 单节点写入；ToolExec ③ 只读）。"""
 
     iteration: NotRequired[Annotated[int, PrivateStateAttr]]
     tokens_used: NotRequired[Annotated[int, PrivateStateAttr]]
@@ -43,7 +69,6 @@ class RunState(AgentState):
     repeat: NotRequired[Annotated[dict[str, Any] | None, PrivateStateAttr]]
     termination: NotRequired[Annotated[dict[str, Any] | None, PrivateStateAttr]]
     approved_calls: NotRequired[Annotated[list[str], PrivateStateAttr]]
-    disabled_tools: NotRequired[Annotated[list[str], PrivateStateAttr]]
 
 
 def run_channels_reset(token_seed: int) -> dict[str, Any]:
@@ -55,7 +80,6 @@ def run_channels_reset(token_seed: int) -> dict[str, Any]:
         "repeat": None,
         "termination": None,
         "approved_calls": [],
-        "disabled_tools": [],
     }
 
 
@@ -83,10 +107,34 @@ class ToolSerializer:
             self._cond.notify_all()
 
 
+class ToolHealth:
+    """每 run 一份的工具健康账（v1 ToolExecutor 的实例状态）：连败计数 / 本轮禁用集 / 本步是否已写 termination。
+
+    住 RunContext 而不是通道：tools 节点每调用一任务，无 reducer 通道同一步只许一个写者（探针 M2.4-Q3）；
+    禁用不跨 run（v1 同款：恢复 run 从零记账）。terminated 让取消检查点在一轮多调用时只由第一个被弃置的调用写 termination。
+    """
+
+    def __init__(self) -> None:
+        self.fail_streaks: dict[str, int] = {}
+        self.disabled: set[str] = set()
+        self.terminated = False
+
+    def record_failure(self, name: str) -> int:
+        """记一次失败，返回当前连败数；达上限即禁用（当次回填里宣告，模型立刻知道该改道）。"""
+        streak = self.fail_streaks.get(name, 0) + 1
+        self.fail_streaks[name] = streak
+        if streak >= FAIL_STREAK_LIMIT:
+            self.disabled.add(name)
+        return streak
+
+    def record_success(self, name: str) -> None:
+        self.fail_streaks.pop(name, None)
+
+
 @dataclass(frozen=True, slots=True)
 class RunContext:
     """每 run 一份的载体（create_agent 的 context_schema）。sessions=None 是纯单元测试形态（无状态机）；
-    cancel=None 即无取消源（闸门 #6 永不触发）——M3 的 API 层把客户端断连 / 用户取消翻译成信号注入。"""
+    cancel=None 即无取消源（闸门 #6 永不触发）；gateway=None 即工具结果超预算只硬截断（不摘要）。"""
 
     tenant_id: str
     user_id: str
@@ -98,7 +146,9 @@ class RunContext:
     sessions: SessionStateLike | None = None
     token_seed: int = 0
     cancel: CancelSignal | None = None
+    gateway: BaseChatModel | None = None
     tool_order: ToolSerializer = field(default_factory=ToolSerializer)
+    tool_health: ToolHealth = field(default_factory=ToolHealth)
 
 
 FALLBACK_BY_REASON: dict[TerminationReason, str | None] = {
@@ -154,7 +204,7 @@ async def emit(
 ) -> tuple[AgentEvent, bool]:
     """钩子内写一条事实：派生 id → append（返回 seq 与是否新建）→ 新建的经 stream_writer 外流。
 
-    返回 (event, created)：created=False 即重放命中既有事件（ToolExec 据此进 reexecute 分支，M2.5）。
+    返回 (event, created)：created=False 即重放命中既有事件（ToolExec 据此进 reexecute 分支：同一把钥匙）。
     事实源异常（不可用 / 围栏）裸穿：run 炸出去，不接。
     """
     ctx = runtime.context
