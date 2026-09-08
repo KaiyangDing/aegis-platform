@@ -1,4 +1,4 @@
-"""AgentRuntime 门面（M2.3）：按 (tenant_id, spec 指纹) 编译并缓存图；run() 单入口驱动一次循环、事件按 seq 序外流。
+"""AgentRuntime 门面（M2.3；M2.4 插入 Gates、接取消信号）：按 (tenant_id, spec 指纹) 编译并缓存图；run() 单入口驱动一次循环、事件按 seq 序外流。
 
 一次 run（ADR-011 / 012）：读会话行取身份并核对租户归属 → D8 种子（历史 llm_call / llm_result 的估算字段求和）→
 T1 idle→running（CAS 失败 = 会话正忙）→ agent.astream(..., durability="sync", recursion_limit=推导, stream_mode=["custom"])
@@ -22,10 +22,12 @@ from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from app.engine.runtime.events import AgentEvent, EventType
+from app.engine.runtime.middleware.gates import Gates
 from app.engine.runtime.middleware.model_call import ModelCall
 from app.engine.runtime.middleware.run_events import RunEvents
 from app.engine.runtime.middleware.tool_exec import ToolExec
 from app.engine.runtime.protocols import (
+    CancelSignal,
     EventStoreLike,
     SessionRunState,
     SessionStateLike,
@@ -34,8 +36,14 @@ from app.engine.runtime.spec import AgentSpec, LoopPolicy
 from app.engine.runtime.state import RunContext
 from app.engine.runtime.tools import ToolRegistry, to_structured_tools
 
-MIDDLEWARE_STACK: tuple[type[AgentMiddleware], ...] = (RunEvents, ModelCall, ToolExec)
-"""栈序即语义（ADR-012 决策 1）。M2.3 形态；Guards / AegisSummarization / Approvals / Gates 随后续步插入到指定位置。"""
+MIDDLEWARE_STACK: tuple[type[AgentMiddleware], ...] = (
+    RunEvents,
+    Gates,
+    ModelCall,
+    ToolExec,
+)
+"""栈序即语义（ADR-012 决策 1）。M2.4 形态：Gates 紧贴 ModelCall 之前（before_model 按列表序在压缩之后、after_model 反序先于审批）；
+Guards / AegisSummarization / Approvals 随后续步插入到指定位置。"""
 
 _HOOKS_PER_PHASE = {
     "before_agent": ("before_agent", "abefore_agent"),
@@ -62,11 +70,11 @@ def _hook_count(middleware: Sequence[type[AgentMiddleware]], phase: str) -> int:
 def recursion_limit_for(
     policy: LoopPolicy, middleware: Sequence[type[AgentMiddleware]] = MIDDLEWARE_STACK
 ) -> int:
-    """从栈形态推导：节点执行数 + 1（探针⑻：最小可行 recursion_limit = 节点数 + 1）。
+    """从栈形态推导：最长路径的节点执行数 + 1（探针⑻ / M2.4-Q4：最小可行 recursion_limit = 节点数 + 1）。
 
-    最长路径 = before_agent 节点 + max_iterations × (before_model 节点 + model + after_model 节点 + tools)
-    + 终止那一遍的 before_model 节点 + after_agent 节点。tools 按每轮一次计（最后一轮没有 tools，
-    多算的那一次就是"+1 余量"）。
+    最长路径 = 工具循环撞 max_iterations：before_agent 节点 + max_iterations × (before_model 节点 + model + after_model 节点 + tools)
+    + 终止那一遍的 before_model 节点（Gates 在此 jump end）+ after_agent 节点。对这条路径公式精确（余量 0）；
+    文本完成等更短的路径自然有余量。栈里没有 before_model 钩子时公式对该路径少算一个节点（M2.3 形态的已知缺口，Gates 入栈后消失）。
     """
     per_iteration = (
         _hook_count(middleware, "before_model")
@@ -167,11 +175,18 @@ class AgentRuntime:
         return seed
 
     async def run(
-        self, *, tenant_id: str, session_id: str, user_input: str, spec: AgentSpec
+        self,
+        *,
+        tenant_id: str,
+        session_id: str,
+        user_input: str,
+        spec: AgentSpec,
+        cancel: CancelSignal | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """驱动一次完整循环；产出事件 ≡ 本 run 落盘事件，yield 序 ≡ seq 序。
 
         会话行不存在 / 不属于该租户 → ValueError（起跑前的归属校验）；不在 idle → SessionBusy。
+        cancel 是闸门 #6 的取消源（None = 无取消源）。
         run 内异常（ProviderError 泄漏、事实源不可用）裸穿，run_state 留在 running——由恢复路径（M2.9）分诊。
         """
         row = await self._sessions.get(session_id)
@@ -196,6 +211,7 @@ class AgentRuntime:
             events=self._events,
             sessions=self._sessions,
             token_seed=token_seed,
+            cancel=cancel,
         )
         agent = self.build_agent(tenant_id, spec)
         config = {

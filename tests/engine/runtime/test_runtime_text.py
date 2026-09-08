@@ -1,15 +1,14 @@
 """AgentRuntime 首条端到端（M2.3）：文本 run 五事件序列与 payload 形态、yield 序 ≡ seq 序、状态机 T1/T4 与归属校验、
-私有通道在 run 起点归零（发现 F1）、第二轮接续 seq、model_settings 载体到达候选、D8 种子。零真实调用。"""
+私有通道在 run 起点归零（发现 F1）、第二轮接续 seq、model_settings 载体到达候选、D8 种子。零真实调用。
+input_tokens_est 的口径测试随 M2.6 移到 test_context（编译后 prompt）。"""
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
 
 pytest.importorskip(
     "app.engine.runtime.runtime",
     reason="M2.3 未敲：app/engine/runtime/runtime.py 不存在",
 )
 
-from app.core.tokens import estimate_messages_tokens
 from app.engine.runtime import utterances as u
 from app.engine.runtime.events import AgentEvent, EventType
 from app.engine.runtime.runtime import SessionBusy
@@ -161,18 +160,6 @@ async def test_model_settings_carrier_reaches_gateway_and_candidate():
     seen = cand.seen_kwargs[0]
     assert seen["max_tokens"] == 321
     assert "tier" not in seen and "deadline_s" not in seen and "session_id" not in seen
-
-
-async def test_input_estimate_covers_system_prompt_and_user_message():
-    rt, _, _, sessions = make_runtime(text_turn("好"))
-    sid = await _session(sessions)
-    got = await collect(
-        rt, tenant_id="t-a", session_id=sid, user_input="退款申请", spec=SPEC
-    )
-    expected = estimate_messages_tokens(
-        [AIMessage(SPEC.system_prompt), HumanMessage("退款申请")]
-    )
-    assert got[1].payload["input_tokens_est"] == expected
 
 
 async def test_token_seed_rebuilt_from_history_events():

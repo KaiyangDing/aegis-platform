@@ -5,7 +5,7 @@
 不在此列：开发者面向的校验与配置错误（ValueError / ToolRegistrationError 文本）——随校验逻辑就近可读，
 不进事件不进对话（与 L1 utterances 的例外登记同一分野）。
 按消费步骤分组；M2.1 自身不消费任何一条，全部为后续步预留的同一份事实源（v1 loop / guardrails / context /
-executor / runtime 五处逐字迁入；标 "v2" 的两条是本仓新增）。框架自带的英文串（ModelCallLimit 的
+executor / runtime 五处逐字迁入；标 "v2" 的条目是本仓新增）。框架自带的英文串（ModelCallLimit 的
 "Model call limits exceeded"、ToolNode 的 "… is not a valid tool"、Summarization 的 "Here is a summary…"）
 一律不落入事件与对话：对应中间件在其产生之前拦截（ADR-012）。
 """
@@ -30,6 +30,9 @@ PROMPT_PROTOCOL_RETRY = (
     "你的上一条输出不符合协议：需要非空的文字回答，或与停止原因一致的工具调用。"
     "请重新输出——要么给出面向用户的回答，要么发起一个有效的工具调用。"
 )
+# v2：终止 / 取消时最后一条 AIMessage 的每个 tool_call 都要配对 ToolMessage（ADR-012 决策 5），被弃置的调用回填这两条
+TOOL_NOT_EXECUTED = "本次处理已终止，该调用未执行。"
+TOOL_CANCELLED = "收到取消信号，该调用未执行。"
 
 # --- 守卫三段（M2.8：入口拒答 / 中等打标 / 分类指令 / 不可信包裹 / 出口止损） ---
 REFUSAL_TEMPLATE = "你的这条消息包含疑似改写系统行为或越权的指令，本次无法处理。如需帮助请换一种说法，或转人工客服。"
@@ -90,6 +93,11 @@ TOOL_SUMMARY_PREFIX = "（工具结果超预算，以下为摘要）"
 TOOL_ERROR_TIMEOUT_UNKNOWN = "执行超时，结果不明"
 TOOL_ERROR_TIMEOUT = "执行超时（>{timeout_s:g}s）"
 TOOL_ERROR_MISSING_ON_RECOVERY = "恢复期工具缺失：不在当前 AgentSpec.tools"
+# v2：工具结果超预算时 fast 档摘要的指令（v1 两道共用 SUMMARIZE_PROMPT，v2 按对象分开）
+TOOL_DIGEST_PROMPT = (
+    "请将下面的工具返回结果压缩为要点摘要：保留订单号、金额、状态、时间等关键字段与结论，"
+    "省略重复与无关字段；只输出摘要正文。"
+)
 
 # --- 审批（M2.7）与批准后前置校验（M3 注入） ---
 DISCARDED_NOTE = "该调用在等待人工审批期间未执行；如仍需要请重新发起。"
@@ -99,3 +107,8 @@ PRECHECK_VETO_TEMPLATE = "审批已通过但前置校验未过：{reason}，操�
 LOG_RUN_STATE_FLIP_FAILED = (
     "终止时 run_state 翻转失败（会话所有权可能已旁落，状态机被旁路）"
 )
+LOG_TOOL_REEXECUTE = "重放命中既有 tool_call 事件：以原幂等键重执行，不产生第二把钥匙"
+LOG_TOOL_DIGEST_FALLBACK = "工具结果摘要失败，走硬截断（增强层 fail-open）"
+LOG_SUMMARY_FALLBACK = "滚动摘要失败，走提取式降级（增强层 fail-open）"
+LOG_HISTORY_CLEARED = "user_input 估算超出 history_budget，历史层清空、原文照放"
+LOG_TOOL_FOLD_OVER_BUDGET = "工具结果层全部折叠后仍超预算，照放并由余量消化"

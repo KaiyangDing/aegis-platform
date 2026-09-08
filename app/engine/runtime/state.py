@@ -1,8 +1,10 @@
-"""图状态私有通道 + run 载体 + 钩子内事件发射（M2.3）。
+"""图状态私有通道 + run 载体 + 钩子内事件发射（M2.3；M2.4 加取消信号与终止辅助）。
 
 RunState：在框架 AgentState（messages / jump_to）之上加运行时私有通道，全部 PrivateStateAttr——不进 ainvoke 输出与 schema，
 但随 checkpoint 持久化且**跨 run 延续**（探针⑵）：run 级计数由 RunEvents.before_agent 显式归零（ADR-012 决策 8）。
-RunContext：每 run 一份、不进 checkpoint 的载体（身份 / spec / 注册表 / 事实源 / 状态机 / token 种子 / 工具串行器）；
+通道无 reducer、后写覆盖，且同一 superstep 只许一个写者（探针 M2.4-Q3：两个并行工具任务同时写即 InvalidUpdateError）——
+每调用一任务的 tools 节点里，只有"第一个被弃置的调用"写 termination；按工具计的连败账不能放通道（M2.5 放 RunContext）。
+RunContext：每 run 一份、不进 checkpoint 的载体（身份 / spec / 注册表 / 事实源 / 状态机 / token 种子 / 取消信号 / 工具串行器）；
 跨崩溃需要的状态只能放通道或表，不能放这里。
 emit()：钩子内写事件的唯一入口——id 派生自 (session_id, 框架任务 id, 钩子名, 序号)，先落盘再经 stream_writer 外流；
 去重命中（重放）不再外流。
@@ -20,15 +22,20 @@ from langgraph.runtime import Runtime
 
 from app.engine.runtime import utterances as u
 from app.engine.runtime.events import AgentEvent, EventType, event_id
-from app.engine.runtime.protocols import EventSink, SessionStateLike
+from app.engine.runtime.protocols import CancelSignal, EventSink, SessionStateLike
 from app.engine.runtime.spec import AgentSpec, TerminationReason
 from app.engine.runtime.tools import ToolRegistry
+
+AEGIS_SOURCE = "aegis_source"
+"""运行时注入消息的标记键（additional_kwargs）：闸门 #5 的纠错提示带 {AEGIS_SOURCE: SOURCE_PROTOCOL_RETRY}，
+上下文编译（M2.6）据此区分"用户原话"与"运行时注入"；框架的摘要消息用它自己的 lc_source 键。"""
+SOURCE_PROTOCOL_RETRY = "protocol_retry"
 
 
 class RunState(AgentState):
     """私有通道（无 reducer：后写覆盖）。iteration = 已发起的 LLM 调用数；tokens_used = 会话级估算累计（D8 种子起）；
-    violations / repeat 归闸门 #5 / #4（M2.4）；termination 是唯一终止信号（ADR-012 决策 3）；
-    approved_calls / disabled_tools 归审批（M2.7）/ 连败禁用（M2.5）。"""
+    violations（闸门 #5 连续违规数）/ repeat（闸门 #4 的 {key, streak}）归 Gates（M2.4）；termination 是唯一终止信号（ADR-012 决策 3）；
+    approved_calls 归审批（M2.7）；disabled_tools 归连败禁用（M2.5）。"""
 
     iteration: NotRequired[Annotated[int, PrivateStateAttr]]
     tokens_used: NotRequired[Annotated[int, PrivateStateAttr]]
@@ -78,7 +85,8 @@ class ToolSerializer:
 
 @dataclass(frozen=True, slots=True)
 class RunContext:
-    """每 run 一份的载体（create_agent 的 context_schema）。sessions=None 是纯单元测试形态（无状态机）。"""
+    """每 run 一份的载体（create_agent 的 context_schema）。sessions=None 是纯单元测试形态（无状态机）；
+    cancel=None 即无取消源（闸门 #6 永不触发）——M3 的 API 层把客户端断连 / 用户取消翻译成信号注入。"""
 
     tenant_id: str
     user_id: str
@@ -89,6 +97,7 @@ class RunContext:
     events: EventSink
     sessions: SessionStateLike | None = None
     token_seed: int = 0
+    cancel: CancelSignal | None = None
     tool_order: ToolSerializer = field(default_factory=ToolSerializer)
 
 
@@ -121,6 +130,12 @@ def terminated(
     if cause is not None:
         value["cause"] = cause
     return value
+
+
+def discard_note(base: str, total: int, index: int) -> str:
+    """工具序列中途终止时，把被弃置的剩余调用数写进 detail 留痕（v1 D20）：index 是触发终止的那个调用的位置。"""
+    discarded = total - index - 1
+    return f"{base}；弃置本轮剩余 {discarded} 个调用" if discarded else base
 
 
 def task_coords() -> tuple[str, str | None]:

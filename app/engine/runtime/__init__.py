@@ -10,6 +10,7 @@ from app.engine.runtime.events import (
     normalize_events,
 )
 from app.engine.runtime.protocols import (
+    CancelSignal,
     EventSink,
     EventSource,
     EventStoreLike,
@@ -51,6 +52,7 @@ __all__ = [
     "AgentEvent",
     "AgentRuntime",
     "AgentSpec",
+    "CancelSignal",
     "ContextConfig",
     "EventSink",
     "EventSource",

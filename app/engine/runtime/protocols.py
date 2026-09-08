@@ -1,4 +1,4 @@
-"""运行时依赖的跨包协议：事件落盘与读取（M2.1 / M2.2）、会话调度状态（M2.2）；审批单 / 取消信号随 M2.7 / M2.4 补。
+"""运行时依赖的跨包协议：事件落盘与读取（M2.1 / M2.2）、会话调度状态（M2.2）、取消信号（M2.4）；审批单随 M2.7 补。
 
 方法签名只用内建类型（M1 自律②）：domain 靠结构匹配实现，不 import engine；
 deps.py 是唯一同时 import 二者的模块（ADR-003 分层 + M2 第四条契约 gateway ↛ runtime）。
@@ -78,3 +78,13 @@ class SessionStateLike(Protocol):
     async def bump_recovery(self, session_id: str) -> int | None: ...
 
     async def reset_recovery(self, session_id: str) -> None: ...
+
+
+@runtime_checkable
+class CancelSignal(Protocol):
+    """闸门 #6 的取消源：只要 is_set()（asyncio.Event 天然满足；M3 的 API 层把客户端断连 / 用户取消翻译成它）。
+
+    检查点两处：每次 LLM 调用前（Gates.before_model）与每个工具调用前（ToolExec，M2.5）；命中即 cancelled 终止，零话术。
+    """
+
+    def is_set(self) -> bool: ...

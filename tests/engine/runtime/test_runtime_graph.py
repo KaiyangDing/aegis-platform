@@ -1,43 +1,47 @@
-"""图工厂（M2.3）：recursion_limit 推导式与紧致性（探针⑻）、栈序与节点快照、按 (tenant, spec 指纹) 缓存、指纹敏感性。"""
+"""图工厂（M2.3；M2.4 / M2.6 随栈更新）：栈序与节点快照、按栈推导的 recursion_limit、按 (tenant, spec 指纹) 缓存、指纹敏感性。
+推导式的紧致性在 test_runtime_gates（最长路径 -1 即炸）。本文件钉 M2.6 定稿的栈；M2.6 未敲时整体跳过。"""
 
 import pytest
 
 pytest.importorskip(
-    "app.engine.runtime.runtime",
-    reason="M2.3 未敲：app/engine/runtime/runtime.py 不存在",
+    "app.engine.runtime.middleware.summarization",
+    reason="M2.6 未敲：middleware/summarization.py 不存在（栈快照按 M2.6 定稿）",
 )
 
-from langchain_core.messages import HumanMessage
-from langgraph.errors import GraphRecursionError
-
+from app.engine.runtime.middleware.gates import Gates
 from app.engine.runtime.middleware.model_call import ModelCall
 from app.engine.runtime.middleware.run_events import RunEvents
+from app.engine.runtime.middleware.summarization import AegisSummarization
 from app.engine.runtime.middleware.tool_exec import ToolExec
 from app.engine.runtime.runtime import (
     MIDDLEWARE_STACK,
+    build_middleware,
     recursion_limit_for,
     spec_fingerprint,
 )
 from app.engine.runtime.spec import AgentSpec, ContextConfig, LoopPolicy
-from app.engine.runtime.state import RunContext
-from app.engine.runtime.tools import ToolRegistry
+from tests.engine.gateway.doubles import scripted
 from tests.engine.runtime.demo_tools import build_registry
-from tests.engine.runtime.doubles import (
-    MemoryEventStore,
-    collect,
-    make_runtime,
-    text_turn,
-    tool_turn,
-)
+from tests.engine.runtime.doubles import make_runtime, scripted_gateway_factory
 
 
 def test_stack_order_and_graph_nodes_snapshot():
-    assert MIDDLEWARE_STACK == (RunEvents, ModelCall, ToolExec)
-    rt, _, _, _ = make_runtime()
-    agent = rt.build_agent(
-        "t-a", AgentSpec(system_prompt="x", tools=build_registry().specs())
+    assert MIDDLEWARE_STACK == (
+        RunEvents,
+        AegisSummarization,
+        Gates,
+        ModelCall,
+        ToolExec,
     )
+    spec = AgentSpec(system_prompt="x", tools=build_registry().specs())
+    gateway = scripted_gateway_factory(scripted())("t-a")
+    assert [type(m) for m in build_middleware(gateway, spec)] == list(MIDDLEWARE_STACK)
+    rt, _, _, _ = make_runtime()
+    agent = rt.build_agent("t-a", spec)
     assert sorted(agent.get_graph().nodes) == [
+        "AegisSummarization.before_model",
+        "Gates.after_model",
+        "Gates.before_model",
         "RunEvents.after_agent",
         "RunEvents.before_agent",
         "__end__",
@@ -47,56 +51,10 @@ def test_stack_order_and_graph_nodes_snapshot():
     ]
 
 
-@pytest.mark.parametrize(("max_iterations", "expected"), [(1, 5), (3, 9), (10, 23)])
+@pytest.mark.parametrize(("max_iterations", "expected"), [(1, 10), (3, 20), (10, 55)])
 def test_recursion_limit_formula_for_current_stack(max_iterations: int, expected: int):
-    """M2.3 栈：外圈 2 节点 + 每轮 (model + tools) 2 节点 + 1 余量 → 2·max_iterations + 3。"""
+    """M2.6 栈：外圈 2 + 每轮 (2 before_model + model + after_model + tools) 5 + 终止那一遍 2 个 before_model + 1 → 5·M + 5。"""
     assert recursion_limit_for(LoopPolicy(max_iterations=max_iterations)) == expected
-
-
-async def test_recursion_limit_is_tight_against_probe():
-    """探针⑻：k 轮工具循环最少要 2k+4；推导值 2·M+3（M=k+1）恰好多 1，再减 2 就撞 GraphRecursionError。"""
-    spec = AgentSpec(
-        system_prompt="x",
-        model_tier="fast",
-        tools=build_registry().specs(),
-        policy=LoopPolicy(max_iterations=3),
-    )
-    acts = [
-        tool_turn(("demo_order_query", {"order_id": "1"}, "c1")),
-        tool_turn(("demo_order_query", {"order_id": "2"}, "c2")),
-        text_turn("完成"),
-    ]
-    rt, _, _, sessions = make_runtime(*acts)
-    await sessions.create("s-1", tenant_id="t-a", user_id="u-1")
-    got = await collect(
-        rt, tenant_id="t-a", session_id="s-1", user_input="x", spec=spec
-    )
-    assert got[-1].payload == {
-        "reason": "completed",
-        "iteration": 3,
-        "detail": "stop_reason=stop",
-    }
-
-    rt2, _, _, _ = make_runtime(*acts)
-    agent = rt2.build_agent("t-a", spec)
-    ctx = RunContext(
-        tenant_id="t-a",
-        user_id="u-1",
-        session_id="s-2",
-        run_id="r-2",
-        spec=spec,
-        registry=ToolRegistry(spec.tools),
-        events=MemoryEventStore(),
-    )
-    with pytest.raises(GraphRecursionError):
-        await agent.ainvoke(
-            {"messages": [HumanMessage("x")]},
-            {
-                "configurable": {"thread_id": "s-2"},
-                "recursion_limit": recursion_limit_for(spec.policy) - 2,
-            },
-            context=ctx,
-        )
 
 
 def test_agent_cache_keys_on_tenant_and_spec_fingerprint():

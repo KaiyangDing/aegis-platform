@@ -19,7 +19,12 @@ from app.engine.gateway.router import AegisGateway
 from app.engine.gateway.routing import Candidate
 from app.engine.runtime.events import AgentEvent
 from app.engine.runtime.runtime import AgentRuntime
-from tests.engine.gateway.doubles import ScriptedCandidate, StubBreaker, StubLimiter
+from tests.engine.gateway.doubles import (
+    ScriptedCandidate,
+    StubBreaker,
+    StubLimiter,
+    finish,
+)
 
 USAGE = {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
 
@@ -46,6 +51,11 @@ def tool_turn(*calls: tuple[str, dict[str, Any], str]) -> list[AIMessageChunk]:
             tool_calls=[{"name": n, "args": a, "id": i} for n, a, i in calls],
         )
     )
+
+
+def empty_turn(stop: str = "stop") -> list[AIMessageChunk]:
+    """空输出轮（闸门 #5 的两种违规形态）：只有收尾块——stop="tool_calls" 即"宣告工具停却没给调用"。"""
+    return [finish(stop)]
 
 
 class MemoryEventStore:
