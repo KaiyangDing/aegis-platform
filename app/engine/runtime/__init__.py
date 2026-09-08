@@ -1,5 +1,6 @@
-"""L2 运行时：注入面（AgentSpec / ToolDef）、事件事实、话术、跨包协议、图状态与门面。不被 gateway import（import-linter 第四条契约）。"""
+"""L2 运行时：注入面（AgentSpec / ToolDef）、事件事实、话术、跨包协议、图状态、上下文编译与门面。不被 gateway import（import-linter 第四条契约）。"""
 
+from app.engine.runtime.context import CompiledPrompt, compile_prompt
 from app.engine.runtime.events import (
     EVENT_ID_NAMESPACE,
     SCHEMA_VERSION,
@@ -21,6 +22,7 @@ from app.engine.runtime.runtime import (
     MIDDLEWARE_STACK,
     AgentRuntime,
     SessionBusy,
+    build_middleware,
     recursion_limit_for,
     spec_fingerprint,
 )
@@ -34,10 +36,12 @@ from app.engine.runtime.spec import (
 )
 from app.engine.runtime.state import RunContext, RunState
 from app.engine.runtime.tools import (
+    OutcomeKind,
     RiskPolicy,
     SideEffect,
     ToolContext,
     ToolDef,
+    ToolOutcome,
     ToolRegistrationError,
     ToolRegistry,
     to_structured_tools,
@@ -53,12 +57,14 @@ __all__ = [
     "AgentRuntime",
     "AgentSpec",
     "CancelSignal",
+    "CompiledPrompt",
     "ContextConfig",
     "EventSink",
     "EventSource",
     "EventStoreLike",
     "EventType",
     "LoopPolicy",
+    "OutcomeKind",
     "RiskPolicy",
     "RunContext",
     "RunState",
@@ -70,8 +76,11 @@ __all__ = [
     "TerminationReason",
     "ToolContext",
     "ToolDef",
+    "ToolOutcome",
     "ToolRegistrationError",
     "ToolRegistry",
+    "build_middleware",
+    "compile_prompt",
     "event_id",
     "normalize_event",
     "normalize_events",

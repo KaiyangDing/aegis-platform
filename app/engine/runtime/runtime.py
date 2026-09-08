@@ -1,4 +1,5 @@
-"""AgentRuntime 门面（M2.3；M2.4 插入 Gates、接取消信号；M2.5 网关句柄进 RunContext）：按 (tenant_id, spec 指纹) 编译并缓存图；run() 单入口驱动一次循环、事件按 seq 序外流。
+"""AgentRuntime 门面（M2.3；M2.4 插入 Gates、接取消信号；M2.5 网关句柄进 RunContext；M2.6 插入 AegisSummarization、栈经 build_middleware 注入依赖）：
+按 (tenant_id, spec 指纹) 编译并缓存图；run() 单入口驱动一次循环、事件按 seq 序外流。
 
 一次 run（ADR-011 / 012）：读会话行取身份并核对租户归属 → D8 种子（历史 llm_call / llm_result 的估算字段求和）→
 T1 idle→running（CAS 失败 = 会话正忙）→ agent.astream(..., durability="sync", recursion_limit=推导, stream_mode=["custom"])
@@ -25,6 +26,7 @@ from app.engine.runtime.events import AgentEvent, EventType
 from app.engine.runtime.middleware.gates import Gates
 from app.engine.runtime.middleware.model_call import ModelCall
 from app.engine.runtime.middleware.run_events import RunEvents
+from app.engine.runtime.middleware.summarization import AegisSummarization
 from app.engine.runtime.middleware.tool_exec import ToolExec
 from app.engine.runtime.protocols import (
     CancelSignal,
@@ -38,12 +40,13 @@ from app.engine.runtime.tools import ToolRegistry, to_structured_tools
 
 MIDDLEWARE_STACK: tuple[type[AgentMiddleware], ...] = (
     RunEvents,
+    AegisSummarization,
     Gates,
     ModelCall,
     ToolExec,
 )
-"""栈序即语义（ADR-012 决策 1）。M2.4 形态：Gates 紧贴 ModelCall 之前（before_model 按列表序在压缩之后、after_model 反序先于审批）；
-Guards / AegisSummarization / Approvals 随后续步插入到指定位置。"""
+"""栈序即语义（ADR-012 决策 1）。M2.6 形态：before_model 按列表序 = 压缩 → 闸门；after_model 反序 = 闸门先于（M2.7 插在
+AegisSummarization 与 Gates 之间的）审批；Guards 随 M2.8 插到 RunEvents 之后。build_middleware 与本元组一一对应（静态测试互钉）。"""
 
 _HOOKS_PER_PHASE = {
     "before_agent": ("before_agent", "abefore_agent"),
@@ -55,6 +58,18 @@ _HOOKS_PER_PHASE = {
 
 class SessionBusy(RuntimeError):
     """T1 CAS 失败：会话不在 idle（另一 run 在跑或挂起等审批）。M3 翻译为 409。"""
+
+
+def build_middleware(gateway: BaseChatModel, spec: AgentSpec) -> list[AgentMiddleware]:
+    """按栈序实例化：需要依赖的中间件在这里注入——摘要模型 = 该租户网关（fast 档在调用时指定）、预算 = spec.context_config
+    （在指纹里，改预算即换图）。"""
+    return [
+        RunEvents(),
+        AegisSummarization(gateway, config=spec.context_config),
+        Gates(),
+        ModelCall(),
+        ToolExec(),
+    ]
 
 
 def _hook_count(middleware: Sequence[type[AgentMiddleware]], phase: str) -> int:
@@ -149,11 +164,12 @@ class AgentRuntime:
         if agent is not None:
             self._agents.move_to_end(key)
             return agent
+        gateway = self._gateway_for(tenant_id)
         agent = create_agent(
-            model=self._gateway_for(tenant_id),
+            model=gateway,
             tools=to_structured_tools(spec.tools),
             system_prompt=spec.system_prompt,
-            middleware=[cls() for cls in MIDDLEWARE_STACK],
+            middleware=build_middleware(gateway, spec),
             context_schema=RunContext,
             checkpointer=self._checkpointer,
         )
@@ -187,7 +203,7 @@ class AgentRuntime:
 
         会话行不存在 / 不属于该租户 → ValueError（起跑前的归属校验）；不在 idle → SessionBusy。
         cancel 是闸门 #6 的取消源（None = 无取消源）。
-        run 内异常（ProviderError 泄漏、事实源不可用）裸穿，run_state 留在 running——由恢复路径（M2.9）分诊。
+        run 内异常（ProviderError 泄漏、事实源不可用、system 超预算）裸穿，run_state 留在 running——由恢复路径（M2.9）分诊。
         """
         row = await self._sessions.get(session_id)
         if row is None:
