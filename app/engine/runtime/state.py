@@ -1,11 +1,12 @@
-"""图状态私有通道 + run 载体 + 钩子内事件发射（M2.3；M2.4 加取消信号与终止辅助；M2.5 加工具健康账与网关句柄）。
+"""图状态私有通道 + run 载体 + 钩子内事件发射（M2.3；M2.4 加取消信号与终止辅助；M2.5 加工具健康账与网关句柄；
+M2.7 通行证改为 {call id: approval_id}、载体加审批单存取件与前置校验挂点）。
 
 RunState：在框架 AgentState（messages / jump_to）之上加运行时私有通道，全部 PrivateStateAttr——不进 ainvoke 输出与 schema，
 但随 checkpoint 持久化且**跨 run 延续**（探针⑵）：run 级计数由 RunEvents.before_agent 显式归零（ADR-012 决策 8）。
 通道无 reducer、后写覆盖，且同一 superstep 只许一个写者（探针 M2.4-Q3：两个并行工具任务同时写即 InvalidUpdateError）——
 每调用一任务的 tools 节点里，只有"第一个被弃置的调用"写 termination；按工具计的连败账不放通道，放 RunContext.tool_health。
 RunContext：每 run 一份、不进 checkpoint 的载体（身份 / spec / 注册表 / 事实源 / 状态机 / token 种子 / 取消信号 / 网关 /
-工具串行器 / 工具健康账）；跨崩溃需要的状态只能放通道或表，不能放这里。
+审批单存取件 / 前置校验挂点 / 工具串行器 / 工具健康账）；跨崩溃需要的状态只能放通道或表，不能放这里。
 emit()：钩子内写事件的唯一入口——id 派生自 (session_id, 框架任务 id, 钩子名, 序号)，先落盘再经 stream_writer 外流；
 去重命中（重放）不再外流。
 """
@@ -31,9 +32,14 @@ from app.engine.gateway.errors import (
 )
 from app.engine.runtime import utterances as u
 from app.engine.runtime.events import AgentEvent, EventType, event_id
-from app.engine.runtime.protocols import CancelSignal, EventSink, SessionStateLike
+from app.engine.runtime.protocols import (
+    ApprovalStoreLike,
+    CancelSignal,
+    EventSink,
+    SessionStateLike,
+)
 from app.engine.runtime.spec import AgentSpec, TerminationReason
-from app.engine.runtime.tools import ToolRegistry
+from app.engine.runtime.tools import PrecheckHook, ToolRegistry
 
 AEGIS_SOURCE = "aegis_source"
 """运行时注入消息的标记键（additional_kwargs）：闸门 #5 的纠错提示带 {AEGIS_SOURCE: SOURCE_PROTOCOL_RETRY}，
@@ -61,14 +67,14 @@ FAIL_STREAK_LIMIT = 2
 class RunState(AgentState):
     """私有通道（无 reducer：后写覆盖）。iteration = 已发起的 LLM 调用数；tokens_used = 会话级估算累计（D8 种子起）；
     violations（闸门 #5 连续违规数）/ repeat（闸门 #4 的 {key, streak}）归 Gates（M2.4）；termination 是唯一终止信号（ADR-012 决策 3）；
-    approved_calls 是审批通行证（M2.7 由 Approvals 单节点写入；ToolExec ③ 只读）。"""
+    approved_calls 是审批通行证 {模型侧 call id: approval_id}（M2.7 由 Approvals 单节点写入；ToolExec ③ 只读，write-ahead 后凭它回填审批单）。"""
 
     iteration: NotRequired[Annotated[int, PrivateStateAttr]]
     tokens_used: NotRequired[Annotated[int, PrivateStateAttr]]
     violations: NotRequired[Annotated[int, PrivateStateAttr]]
     repeat: NotRequired[Annotated[dict[str, Any] | None, PrivateStateAttr]]
     termination: NotRequired[Annotated[dict[str, Any] | None, PrivateStateAttr]]
-    approved_calls: NotRequired[Annotated[list[str], PrivateStateAttr]]
+    approved_calls: NotRequired[Annotated[dict[str, str], PrivateStateAttr]]
 
 
 def run_channels_reset(token_seed: int) -> dict[str, Any]:
@@ -79,7 +85,7 @@ def run_channels_reset(token_seed: int) -> dict[str, Any]:
         "violations": 0,
         "repeat": None,
         "termination": None,
-        "approved_calls": [],
+        "approved_calls": {},
     }
 
 
@@ -134,7 +140,9 @@ class ToolHealth:
 @dataclass(frozen=True, slots=True)
 class RunContext:
     """每 run 一份的载体（create_agent 的 context_schema）。sessions=None 是纯单元测试形态（无状态机）；
-    cancel=None 即无取消源（闸门 #6 永不触发）；gateway=None 即工具结果超预算只硬截断（不摘要）。"""
+    cancel=None 即无取消源（闸门 #6 永不触发）；gateway=None 即工具结果超预算只硬截断（不摘要）；
+    approvals=None 即无审批单存取件（风险闸门命中时 Approvals 抛 RuntimeError，ToolExec 不回填审批单）；
+    precheck=None 即批准后前置校验全通过（M3 注入真实校验）。"""
 
     tenant_id: str
     user_id: str
@@ -147,6 +155,8 @@ class RunContext:
     token_seed: int = 0
     cancel: CancelSignal | None = None
     gateway: BaseChatModel | None = None
+    approvals: ApprovalStoreLike | None = None
+    precheck: PrecheckHook | None = None
     tool_order: ToolSerializer = field(default_factory=ToolSerializer)
     tool_health: ToolHealth = field(default_factory=ToolHealth)
 

@@ -11,6 +11,8 @@ from app.engine.runtime.events import (
     normalize_events,
 )
 from app.engine.runtime.protocols import (
+    ApprovalStatus,
+    ApprovalStoreLike,
     CancelSignal,
     EventSink,
     EventSource,
@@ -37,6 +39,8 @@ from app.engine.runtime.spec import (
 from app.engine.runtime.state import RunContext, RunState
 from app.engine.runtime.tools import (
     OutcomeKind,
+    PrecheckHook,
+    PrecheckVeto,
     RiskPolicy,
     SideEffect,
     ToolContext,
@@ -56,6 +60,8 @@ __all__ = [
     "AgentEvent",
     "AgentRuntime",
     "AgentSpec",
+    "ApprovalStatus",
+    "ApprovalStoreLike",
     "CancelSignal",
     "CompiledPrompt",
     "ContextConfig",
@@ -65,6 +71,8 @@ __all__ = [
     "EventType",
     "LoopPolicy",
     "OutcomeKind",
+    "PrecheckHook",
+    "PrecheckVeto",
     "RiskPolicy",
     "RunContext",
     "RunState",

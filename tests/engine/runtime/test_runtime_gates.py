@@ -408,9 +408,20 @@ def test_gate_nodes_have_conditional_edges_to_end_and_loop_entry():
         or cls.before_model is not AgentMiddleware.before_model
     )
     assert {"model", "RunEvents.after_agent"} <= targets["Gates.before_model"]
-    assert {"tools", "RunEvents.after_agent", loop_entry} <= targets[
-        "Gates.after_model"
+    # 列表首个 after_model 是循环出口节点（出边 = 模型→工具边：tools / end / 链头）；Gates.after_model 若不是出口节点
+    # （M2.7 起 Approvals 在它之前），默认边指向下一个 after_model 节点，跳转边仍是 end / 链头
+    after_model_nodes = [
+        f"{cls.__name__}.after_model"
+        for cls in MIDDLEWARE_STACK
+        if cls.aafter_model is not AgentMiddleware.aafter_model
+        or cls.after_model is not AgentMiddleware.after_model
     ]
+    exit_node = after_model_nodes[0]
+    assert {"tools", "RunEvents.after_agent", loop_entry} <= targets[exit_node]
+    assert {"RunEvents.after_agent", loop_entry} <= targets["Gates.after_model"]
+    position = after_model_nodes.index("Gates.after_model")
+    if position > 0:
+        assert after_model_nodes[position - 1] in targets["Gates.after_model"]
 
 
 async def test_undeclared_jump_is_silently_ignored_regression():

@@ -2,13 +2,15 @@
 
 顺序（契约 C6 + 闸门 #6 / #2 工具半边）：
   闸门 #6 取消检查点（每个调用前）→ 可用性（幻觉名兜底 / 连败禁用）→ ① 严格校验（lax + extra=forbid；坏参数不进 write-ahead）
-  → ③ 风险闸门（fail-closed：谓词崩溃即阻断；approved_calls 通行证只由 Approvals 写入，M2.7）
-  → ④ write-ahead（tool_call 事件先落盘，事件 id 即幂等键；重放命中既有事件 = reexecute：同一把钥匙、绝不产生第二把）
+  → ③ 风险闸门（fail-closed：谓词崩溃即阻断；approved_calls 通行证只由 Approvals 写入）→ 持通行证者过批准后前置校验
+    （TOCTOU 挂点，否决不终止、不进 write-ahead、留 precheck_vetoed 事件）
+  → ④ write-ahead（tool_call 事件先落盘，事件 id 即幂等键；重放命中既有事件 = reexecute：同一把钥匙、绝不产生第二把；
+    持通行证者把事件 id 回填审批单 = 批准已兑现的唯一凭证）
   → ② 身份注入 ToolContext（LLM 不可控）→ ⑤ asyncio.timeout 取更严，读可退避重试、写恒单次、写超时 = RESULT_UNKNOWN 封死重试话术
   → ⑥ 超预算收缩（fast 档摘要经网关，fail-open 硬截断；产物随事件留痕）→ ⑦ tool_result / tool_error 事件 + 连败两次本轮禁用。
 五结局 ToolOutcome（tools.py）。两种 id 严禁混用：模型侧 tool_call["id"] 只进对话配对与事件 payload 的 model_call_id；
 write-ahead 事件 id 进 ToolContext.tool_call_id 与 tool_result / tool_error 的 tool_call_id。
-每 run 按声明序串行（ToolSerializer）；连败账 / 禁用集 / "本步已写 termination" 住 RunContext.tool_health——
+每 run 按声明序串行（ToolSerializer；只等会进 tools 的前驱——被 after_model 配对的调用不等）；连败账 / 禁用集 / "本步已写 termination" 住 RunContext.tool_health——
 tools 节点每调用一任务，通道同一步只许一个写者（探针 M2.4-Q3）。工具实现一律 async def（同步函数走线程池会丢上下文）。
 """
 
@@ -73,10 +75,17 @@ def _content(value: Any) -> str:
 
 
 def _declared_ids(request: ToolCallRequest) -> list[str]:
-    """本轮最后一条 AIMessage 声明的 tool_call id（声明序 = 串行序 = 事件序）。"""
-    messages = request.state["messages"]
-    last_ai = next((m for m in reversed(messages) if isinstance(m, AIMessage)), None)
-    return [] if last_ai is None else [call["id"] for call in last_ai.tool_calls]
+    """本轮最后一条 AIMessage 声明、且尚未被 after_model 钩子配对的 tool_call id（声明序 = 串行序 = 事件序）。
+
+    已配对的调用（闸门打断 / 幻觉名 / 审批谓词崩溃 fail-closed）不会被送进 tools 节点——串行器若等它就永远等不到（发现 F7）。
+    """
+    paired: set[str] = set()
+    for message in reversed(request.state["messages"]):
+        if isinstance(message, AIMessage):
+            return [c["id"] for c in message.tool_calls if c["id"] not in paired]
+        if isinstance(message, ToolMessage):
+            paired.add(message.tool_call_id)
+    return []
 
 
 def _truncate_to_budget(text: str, budget_tokens: int) -> str:
@@ -166,10 +175,9 @@ class ToolExec(AgentMiddleware[RunState, RunContext]):
                 name,
                 u.TOOL_ARGS_INVALID.format(detail=sanitize_error_text(str(exc))),
             )
-        # ③ 风险闸门：确定性安全闸门，fail-closed——评估不了绝不放行；通行证（approved_calls）只由 Approvals 写入（M2.7）
-        if tool.risk_policy is not None and call_id not in request.state.get(
-            "approved_calls", []
-        ):
+        # ③ 风险闸门：确定性安全闸门，fail-closed——评估不了绝不放行；通行证 {模型侧 call id: approval_id} 只由 Approvals 写入
+        approval_id = (request.state.get("approved_calls") or {}).get(call_id)
+        if tool.risk_policy is not None and approval_id is None:
             try:
                 needs_approval = tool.risk_policy(args, ctx.spec.tenant_config)
             except Exception as exc:  # noqa: BLE001  —— 谓词崩溃 = 阻断
@@ -181,11 +189,33 @@ class ToolExec(AgentMiddleware[RunState, RunContext]):
                     ),
                 )
             if needs_approval:
-                # M2.7 起由 Approvals.after_model 先于 tools 开单挂起；走到这里 = 没拿到通行证，最后一道闸：不执行
+                # Approvals.after_model 先于 tools 开单挂起；走到这里 = 没拿到通行证（谓词非确定或栈漏挂），最后一道闸：不执行
                 return ToolOutcome(
                     OutcomeKind.NEEDS_APPROVAL,
                     name,
                     u.TOOL_NEEDS_APPROVAL.format(name=name),
+                )
+        if approval_id is not None and ctx.precheck is not None:
+            # 批准后前置校验（TOCTOU 挂点，ADR-013 决策 5）：审批的是数小时前的参数快照，执行前重跑业务校验；
+            # 否决不终止、不进 write-ahead（无副作用要保护），观察结果回填模型，细节只进 precheck_vetoed 事件
+            veto = await ctx.precheck(name, args.model_dump(mode="json"))
+            if veto is not None:
+                await emit(
+                    request.runtime,
+                    EventType.PRECHECK_VETOED,
+                    {
+                        "approval_id": approval_id,
+                        "tool_name": name,
+                        "observation": veto.observation,
+                        "detail": veto.detail,
+                    },
+                    hook="precheck_vetoed",
+                    ordinal=call_id,
+                )
+                return ToolOutcome(
+                    OutcomeKind.ERROR,
+                    name,
+                    u.PRECHECK_VETO_TEMPLATE.format(reason=veto.observation),
                 )
         # ④ write-ahead：tool_call 事实先落盘，插入成功是执行副作用的前置；事件 id 即幂等键。
         #    重放命中既有事件（created=False）= reexecute：同一把钥匙透传下游去重，绝不产生第二把
@@ -202,6 +232,9 @@ class ToolExec(AgentMiddleware[RunState, RunContext]):
         )
         if not created:
             logger.info(u.LOG_TOOL_REEXECUTE, tool=name, tool_call_id=event.id)
+        if approval_id is not None and ctx.approvals is not None:
+            # 批准已兑现：把 tool_call 事件 id 回填审批单（CAS 恰一次；重放命中拿 False 属正常）
+            await ctx.approvals.attach_event(approval_id, event_id=event.id)
         # ② 身份注入：LLM 不可控的四个 id + 幂等键
         tool_ctx = ToolContext(
             tenant_id=ctx.tenant_id,

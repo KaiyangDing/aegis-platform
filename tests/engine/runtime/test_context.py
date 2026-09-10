@@ -2,6 +2,8 @@
 当前 user 恒保留、旧轮压成 user + 终答、历史层从最新往回装、摘要份额、工具结果层折叠可回溯、空 AIMessage 丢弃、确定性；
 以及 ModelCall 的 input_tokens_est 按编译后 prompt 估算（链路）。零真实调用。"""
 
+import inspect
+
 import pytest
 
 pytest.importorskip(
@@ -106,6 +108,20 @@ def test_layer_order_snapshot():
     assert _texts(compiled)[:4] == ["摘要", "旧问", "旧答", "当前问"]
     assert compiled.all_messages[0] is compiled.system
     assert compiled.folded == () and compiled.dropped_turns == 0
+
+
+def test_entry_notice_joins_system_layer_and_counts_against_its_budget():
+    """M2.8：MEDIUM 打标提醒紧随不可信声明进 system 层（固定模板），与 system 同层受同一预算；缺省不加。"""
+    if "notice" not in inspect.signature(compile_prompt).parameters:
+        pytest.skip("M2.8 未敲：compile_prompt 尚无 notice 形参")
+    base = "规则\n\n" + u.UNTRUSTED_NOTICE
+    tagged = compile_prompt([HumanMessage("你好")], _spec(), notice=u.SUSPICION_NOTICE)
+    assert tagged.system.content == base + "\n\n" + u.SUSPICION_NOTICE
+    assert compile_prompt([HumanMessage("你好")], _spec()).system.content == base
+    tight = _spec(system_budget=estimate_tokens(base))
+    assert compile_prompt([HumanMessage("你好")], tight).system.content == base
+    with pytest.raises(ValueError, match="system_budget"):
+        compile_prompt([HumanMessage("你好")], tight, notice=u.SUSPICION_NOTICE)
 
 
 def test_system_over_budget_is_loud():

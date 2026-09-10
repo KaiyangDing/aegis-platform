@@ -99,7 +99,15 @@ TOOL_DIGEST_PROMPT = (
     "省略重复与无关字段；只输出摘要正文。"
 )
 
-# --- 审批（M2.7）与批准后前置校验（M3 注入） ---
+# --- 审批（M2.7 Approvals：interrupt 载荷与配对回填）与批准后前置校验（挂点在 ToolExec ③，校验 M3 注入） ---
+# v2：interrupt 载荷 action_requests[].description（借 HITL 载荷形态，中文替换库写死的英文 "Tool execution requires approval"）
+APPROVAL_DESCRIPTION = "工具 {name} 命中风险闸门，需人工审批后执行"
+# v2：拒绝 / 撤回 / 超时时该调用的配对回填（终止一律配对，ADR-012 决策 5）；{status} 取下面三条标签之一
+TOOL_APPROVAL_DENIED = "该操作未获人工审批（{status}），未执行。"
+APPROVAL_LABEL_REJECTED = "被拒绝"
+APPROVAL_LABEL_CANCELLED = "被撤回"
+APPROVAL_LABEL_EXPIRED = "已超时"
+# v1 挂起时弃置其后调用的回填；v2 挂起不弃置（审批后按声明序全部执行），暂无消费者
 DISCARDED_NOTE = "该调用在等待人工审批期间未执行；如仍需要请重新发起。"
 PRECHECK_VETO_TEMPLATE = "审批已通过但前置校验未过：{reason}，操作未执行。"
 
@@ -111,4 +119,6 @@ LOG_TOOL_REEXECUTE = "重放命中既有 tool_call 事件：以原幂等键重�
 LOG_TOOL_DIGEST_FALLBACK = "工具结果摘要失败，走硬截断（增强层 fail-open）"
 LOG_SUMMARY_FALLBACK = "滚动摘要失败，走提取式降级（增强层 fail-open）"
 LOG_HISTORY_CLEARED = "user_input 估算超出 history_budget，历史层清空、原文照放"
+LOG_RISK_POLICY_CRASHED = "风险闸门谓词崩溃：该调用 fail-closed 阻断，不进审批"
+LOG_APPROVAL_FLIP_FAILED = "挂起时 running→awaiting_approval 翻转失败且会话不在 awaiting_approval（状态机被旁路）"
 LOG_TOOL_FOLD_OVER_BUDGET = "工具结果层全部折叠后仍超预算，照放并由余量消化"

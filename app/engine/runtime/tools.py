@@ -1,5 +1,6 @@
 """工具契约（契约 C7）：ToolDef（工具的完整说明书）、ToolContext（运行时注入的身份）、@tool 装饰器、
-ToolRegistry、执行结局 OutcomeKind / ToolOutcome（M2.5），以及 ToolDef → 框架 StructuredTool 的载体转换。
+ToolRegistry、执行结局 OutcomeKind / ToolOutcome（M2.5）、批准后前置校验挂点 PrecheckVeto / PrecheckHook（M2.7），
+以及 ToolDef → 框架 StructuredTool 的载体转换。
 
 核心安全分野：LLM 只能提供业务参数（order_id 这类"查询条件"），身份（tenant_id / user_id）由运行时注入 ctx、
 模型不可控——水平越权的第一道防线在类型签名上就成立。
@@ -61,6 +62,23 @@ RiskPolicy = Callable[[Any, Mapping[str, Any]], bool]
 """风险闸门谓词：(已校验的工具参数, 租户配置) -> 是否需要 HITL 审批。
 参数的真实类型是装饰器为各工具生成的 args 模型，运行时无法静态枚举，故 Any。
 谓词自身崩溃 = 阻断（fail-closed，M2.5 / M2.7 消费）。"""
+
+
+@dataclass(frozen=True, slots=True)
+class PrecheckVeto:
+    """批准后前置校验的否决（TOCTOU 挂点，ADR-013 决策 5）：审批的是数小时前的参数快照，执行前重跑业务校验。
+
+    observation 回填模型：拿不到身份的层说出口的话必须对所有身份安全（统一话术）；detail 是审计细节（具体状态 / 金额上限），
+    只进 precheck_vetoed 事件 payload 与日志——绝不进模型上下文与用户面。
+    """
+
+    observation: str
+    detail: str | None = None
+
+
+PrecheckHook = Callable[[str, Mapping[str, Any]], Awaitable[PrecheckVeto | None]]
+"""(tool_name, 已校验的参数快照) -> None = 通过 / PrecheckVeto = 否决。校验逻辑（订单状态 / 可退余额）M3 注入；M2 缺席 = 全通过。
+否决不终止：工具不执行（无 write-ahead，没有副作用要保护），observation 作为观察结果回填模型（ToolExec ③ 之后 ④ 之前）。"""
 
 
 class OutcomeKind(StrEnum):

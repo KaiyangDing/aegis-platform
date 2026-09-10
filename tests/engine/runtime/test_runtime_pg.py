@@ -1,5 +1,6 @@
-"""真 PG 端到端（M2.3）：EventStore + SessionStateStore + AsyncPostgresSaver 三件真件 + 剧本网关——
-事件带框架坐标落库、seq 连续、会话状态机翻转、checkpoint 链完整。需 docker compose up -d postgres。"""
+"""真 PG 端到端（M2.3；M2.7 加审批链路）：EventStore + SessionStateStore + ApprovalStore + AsyncPostgresSaver 四件真件 + 剧本网关——
+事件带框架坐标落库、seq 连续、会话状态机翻转、checkpoint 链完整；审批挂起后 checkpoint 指向审批节点、进程可下线，
+坐席 CAS 批准后 resume 从挂起点续跑、审批单回填 event_id。需 docker compose up -d postgres。"""
 
 import uuid
 
@@ -68,3 +69,75 @@ async def test_end_to_end_with_real_stores_and_checkpointer(
     assert (
         len(history) >= 6
     )  # 输入 + 起点 + before_agent + model + tools + model + after_agent
+
+
+async def test_approval_suspend_and_resume_with_real_stores(
+    db_session_factory, pg_checkpointer
+):
+    """v1 形态 C 十一事件在真 PG 上：挂起（4）→ 坐席 CAS 批准 → 恢复（7）；单据回填 tool_call 事件 id；seq 连续、id 唯一。"""
+    approvals_mod = pytest.importorskip(
+        "app.domain.approvals", reason="M2.2 未敲：app/domain/approvals.py 不存在"
+    )
+    if not hasattr(approvals_mod, "ApprovalStore"):
+        pytest.skip("M2.7 未敲：approvals.py 尚无 ApprovalStore")
+    events = EventStore(db_session_factory)
+    sessions = SessionStateStore(db_session_factory)
+    approvals = approvals_mod.ApprovalStore(db_session_factory)
+    spec = AgentSpec(
+        system_prompt="你是演示客服。",
+        model_tier="fast",
+        tools=build_registry().specs(),
+        tenant_config={"approval_threshold": 200},
+    )
+    rt, cand, _, _ = make_runtime(
+        tool_turn(("demo_refund_apply", {"order_id": "1024", "amount": 350}, "c1")),
+        text_turn("已退款"),
+        events=events,  # type: ignore[arg-type]
+        sessions=sessions,  # type: ignore[arg-type]
+        checkpointer=pg_checkpointer,
+        approvals=approvals,
+    )
+    sid = f"s-{uuid.uuid4().hex[:8]}"
+    await sessions.create(sid, tenant_id="t-a", user_id="u-1")
+    got = await collect(
+        rt, tenant_id="t-a", session_id=sid, user_input="退款", spec=spec
+    )
+    assert [e.type.value for e in got] == [
+        "user_message",
+        "llm_call",
+        "llm_result",
+        "approval_requested",
+    ]
+    assert (await sessions.get(sid))["run_state"] == "awaiting_approval"
+    agent = rt.build_agent("t-a", spec)
+    cfg = {"configurable": {"thread_id": sid}}
+    snap = await agent.aget_state(cfg)
+    assert snap.next == ("Approvals.after_model",)
+    (ticket,) = await approvals.list_for_session("t-a", sid)
+    assert ticket["status"] == "pending"
+    assert ticket["id"] == got[3].payload["approval_id"]
+    assert got[3].payload["expires_at"] == ticket["expires_at"]
+    assert await approvals.decide(ticket["id"], approved=True, operator_id="op-1")
+    resumed = [
+        e
+        async for e in rt.resume(
+            tenant_id="t-a", session_id=sid, spec=spec, approval_id=ticket["id"]
+        )
+    ]
+    assert [e.type.value for e in resumed] == [
+        "approval_decided",
+        "tool_call",
+        "tool_result",
+        "llm_call",
+        "llm_result",
+        "assistant_message",
+        "loop_terminated",
+    ]
+    rows = await events.read("t-a", sid)
+    assert [r["seq"] for r in rows] == list(range(1, 12))
+    assert len({r["id"] for r in rows}) == 11
+    assert [r["id"] for r in rows] == [e.id for e in got] + [e.id for e in resumed]
+    assert (await approvals.get(ticket["id"]))["event_id"] == resumed[1].id
+    assert (await sessions.get(sid))["run_state"] == "idle"
+    assert (await agent.aget_state(cfg)).next == ()
+    assert cand.calls == 2

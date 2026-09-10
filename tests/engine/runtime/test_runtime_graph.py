@@ -1,14 +1,16 @@
-"""图工厂（M2.3；M2.4 / M2.6 随栈更新）：栈序与节点快照、按栈推导的 recursion_limit、按 (tenant, spec 指纹) 缓存、指纹敏感性。
-推导式的紧致性在 test_runtime_gates（最长路径 -1 即炸）。本文件钉 M2.6 定稿的栈；M2.6 未敲时整体跳过。"""
+"""图工厂（M2.3；M2.4 / M2.6 / M2.7 / M2.8 随栈更新）：栈序与节点快照、按栈推导的 recursion_limit、按 (tenant, spec 指纹) 缓存、指纹敏感性。
+推导式的紧致性在 test_runtime_gates（最长路径 -1 即炸）。本文件钉 M2.8 定稿的七件栈；M2.8 未敲时整体跳过。"""
 
 import pytest
 
 pytest.importorskip(
-    "app.engine.runtime.middleware.summarization",
-    reason="M2.6 未敲：middleware/summarization.py 不存在（栈快照按 M2.6 定稿）",
+    "app.engine.runtime.middleware.guards",
+    reason="M2.8 未敲：middleware/guards.py 不存在（栈快照按 M2.8 定稿）",
 )
 
+from app.engine.runtime.middleware.approvals import Approvals
 from app.engine.runtime.middleware.gates import Gates
+from app.engine.runtime.middleware.guards import Guards
 from app.engine.runtime.middleware.model_call import ModelCall
 from app.engine.runtime.middleware.run_events import RunEvents
 from app.engine.runtime.middleware.summarization import AegisSummarization
@@ -28,7 +30,9 @@ from tests.engine.runtime.doubles import make_runtime, scripted_gateway_factory
 def test_stack_order_and_graph_nodes_snapshot():
     assert MIDDLEWARE_STACK == (
         RunEvents,
+        Guards,
         AegisSummarization,
+        Approvals,
         Gates,
         ModelCall,
         ToolExec,
@@ -40,8 +44,10 @@ def test_stack_order_and_graph_nodes_snapshot():
     agent = rt.build_agent("t-a", spec)
     assert sorted(agent.get_graph().nodes) == [
         "AegisSummarization.before_model",
+        "Approvals.after_model",
         "Gates.after_model",
         "Gates.before_model",
+        "Guards.before_agent",
         "RunEvents.after_agent",
         "RunEvents.before_agent",
         "__end__",
@@ -51,9 +57,10 @@ def test_stack_order_and_graph_nodes_snapshot():
     ]
 
 
-@pytest.mark.parametrize(("max_iterations", "expected"), [(1, 10), (3, 20), (10, 55)])
+@pytest.mark.parametrize(("max_iterations", "expected"), [(1, 12), (3, 24), (10, 66)])
 def test_recursion_limit_formula_for_current_stack(max_iterations: int, expected: int):
-    """M2.6 栈：外圈 2 + 每轮 (2 before_model + model + after_model + tools) 5 + 终止那一遍 2 个 before_model + 1 → 5·M + 5。"""
+    """M2.8 栈：外圈 3（2 before_agent + 1 after_agent）+ 每轮 (2 before_model + model + 2 after_model + tools) 6
+    + 终止那一遍 2 个 before_model + 1 → 6·M + 6。"""
     assert recursion_limit_for(LoopPolicy(max_iterations=max_iterations)) == expected
 
 

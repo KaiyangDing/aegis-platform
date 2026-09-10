@@ -1,9 +1,11 @@
 """工具执行七步（M2.5 ToolExec）：v1 test_executor 三件平移（前厅校验 / 闸门 fail-closed / 连败禁用；write-ahead / 超时取更严 /
 读重试写不重试 / 写超时 RESULT_UNKNOWN；结果规范化 fail-open 留痕）+ v2 新增：重放去重（同任务身份二次进入 → 无第二把幂等键）、
-取消检查点弃置剩余调用、通行证放行、增强层只接六类公开异常。直连 ToolExec 的用例用最小替身 Runtime（task_coords 打桩），
-链路用例走真图。零真实调用。"""
+取消检查点弃置剩余调用、通行证放行、增强层只接六类公开异常；M2.7：通行证是 {call id: approval_id}、持通行证者过批准后前置校验
+（否决 → precheck_vetoed 事件、无 write-ahead）、write-ahead 后回填审批单 event_id 恰一次。直连 ToolExec 的用例用最小替身 Runtime
+（task_coords 打桩），链路用例走真图。零真实调用。"""
 
 import asyncio
+import uuid
 from types import SimpleNamespace
 from typing import Any
 
@@ -43,6 +45,7 @@ from app.engine.runtime.tools import (
 from tests.engine.gateway.doubles import ScriptedCandidate
 from tests.engine.runtime.demo_tools import build_registry, demo_order_query
 from tests.engine.runtime.doubles import (
+    MemoryApprovalStore,
     MemoryEventStore,
     RaisingModel,
     collect,
@@ -50,6 +53,7 @@ from tests.engine.runtime.doubles import (
     scripted_gateway_factory,
     text_turn,
     tool_turn,
+    unwrap_untrusted,
 )
 
 TENANT_CFG = {"approval_threshold": 200}
@@ -88,6 +92,8 @@ def _harness(
     cancel: Any = None,
     policy: LoopPolicy | None = None,
     context_config: ContextConfig | None = None,
+    approvals: Any = None,
+    precheck: Any = None,
 ) -> tuple[RunContext, MemoryEventStore, Any]:
     spec = AgentSpec(
         system_prompt="你是演示客服。",
@@ -97,6 +103,13 @@ def _harness(
         tenant_config=TENANT_CFG,
     )
     events = MemoryEventStore()
+    extras: dict[
+        str, Any
+    ] = {}  # M2.7 之前的 RunContext 没有这两个字段：只在给了值时才传
+    if approvals is not None:
+        extras["approvals"] = approvals
+    if precheck is not None:
+        extras["precheck"] = precheck
     ctx = RunContext(
         tenant_id="t-a",
         user_id="u-1",
@@ -107,6 +120,7 @@ def _harness(
         events=events,
         gateway=gateway,
         cancel=cancel,
+        **extras,
     )
     return ctx, events, SimpleNamespace(context=ctx, stream_writer=lambda e: None)
 
@@ -117,10 +131,16 @@ def _request(
     args: dict[str, Any],
     cid: str = "c1",
     *,
-    approved: tuple[str, ...] = (),
+    approved: Any = (),
     calls: list[tuple[str, dict[str, Any], str]] | None = None,
 ) -> ToolCallRequest:
+    """approved：call id 元组（通行证单号取 ap-{id}）或 {call id: approval_id} 映射（M2.7 通行证形态）。"""
     declared = calls or [(name, args, cid)]
+    passport = (
+        dict(approved)
+        if isinstance(approved, dict)
+        else {call_id: f"ap-{call_id}" for call_id in approved}
+    )
     state = {
         "messages": [
             AIMessage(
@@ -128,7 +148,7 @@ def _request(
                 tool_calls=[{"name": n, "args": a, "id": i} for n, a, i in declared],
             )
         ],
-        "approved_calls": list(approved),
+        "approved_calls": passport,
     }
     return ToolCallRequest(
         tool_call={"name": name, "args": args, "id": cid, "type": "tool_call"},
@@ -142,6 +162,17 @@ async def _call(runtime: Any, request: ToolCallRequest) -> ToolMessage:
     out = await ToolExec().awrap_tool_call(request, handler=None)  # type: ignore[arg-type]
     assert isinstance(out, ToolMessage)
     return out
+
+
+def _body(message: ToolMessage) -> str:
+    """回填正文：M2.8 起经不可信包裹（首尾各一行标记），之前的树原样。"""
+    return unwrap_untrusted(message.content)
+
+
+def _m27() -> None:
+    """M2.7 才有的符号（PrecheckVeto / 通行证回填 / 串行器修正）：未敲时跳过本用例。"""
+    if not hasattr(tools_mod, "PrecheckVeto"):
+        pytest.skip("M2.7 未敲：tools.py 尚无 PrecheckVeto")
 
 
 def test_outcome_kind_values_are_stable():
@@ -166,8 +197,8 @@ async def test_hallucinated_param_named_and_no_write_ahead():
             rt, "demo_refund_apply", {"order_id": "1024", "amount": 80, "coupon": "X"}
         ),
     )
-    assert out.status == "error" and out.content.startswith("参数校验失败：")
-    assert "coupon" in out.content and events.rows == []
+    assert out.status == "error" and _body(out).startswith("参数校验失败：")
+    assert "coupon" in _body(out) and events.rows == []
 
 
 async def test_lax_numeric_string_passes_then_gate_blocks_without_passport():
@@ -177,7 +208,7 @@ async def test_lax_numeric_string_passes_then_gate_blocks_without_passport():
         rt, _request(rt, "demo_refund_apply", {"order_id": "1", "amount": "350"})
     )
     assert out.status == "error"
-    assert out.content == u.TOOL_NEEDS_APPROVAL.format(name="demo_refund_apply")
+    assert _body(out) == u.TOOL_NEEDS_APPROVAL.format(name="demo_refund_apply")
     assert events.rows == []
 
 
@@ -190,9 +221,9 @@ async def test_passport_lets_gated_call_execute():
             rt, "demo_refund_apply", {"order_id": "1", "amount": 350}, approved=("c1",)
         ),
     )
-    assert out.status == "success" and "refunded" in out.content
+    assert out.status == "success" and "refunded" in _body(out)
     assert events.types("s-1") == ["tool_call", "tool_result"]
-    assert events.rows[0]["id"] in out.content  # 幂等键透传进了工具
+    assert events.rows[0]["id"] in _body(out)  # 幂等键透传进了工具
 
 
 def _gate_boom(args: Any, cfg: Any) -> bool:
@@ -209,8 +240,8 @@ async def test_gate_crash_fails_closed_and_is_sanitized():
     ctx, events, rt = _harness(ToolRegistry([demo_gate_bug]))
     out = await _call(rt, _request(rt, "demo_gate_bug", {"amount": 1}))
     assert out.status == "error"
-    assert "fail-closed" in out.content and "未执行" in out.content
-    assert "sk-***" in out.content and "abcdefghijklmnop" not in out.content
+    assert "fail-closed" in _body(out) and "未执行" in _body(out)
+    assert "sk-***" in _body(out) and "abcdefghijklmnop" not in _body(out)
     assert events.rows == [] and ctx.tool_health.fail_streaks == {"demo_gate_bug": 1}
 
 
@@ -220,7 +251,7 @@ async def test_read_tool_never_consults_gate_and_unknown_tool_has_no_streak():
     assert out.status == "success"
     ghost = await _call(rt, _request(rt, "ghost", {}, "c9"))
     assert (
-        ghost.content.startswith("工具 ghost 不存在")
+        _body(ghost).startswith("工具 ghost 不存在")
         and ctx.tool_health.fail_streaks == {}
     )
 
@@ -364,8 +395,8 @@ async def test_write_timeout_is_result_unknown_and_not_a_failure(no_retry_sleep)
     ctx, events, rt = _harness(ToolRegistry([slow_write]))
     out = await _call(rt, _request(rt, "slow_write", {}))
     assert out.status == "error"
-    assert out.content == u.TOOL_RESULT_UNKNOWN.format(name="slow_write")
-    assert "禁止重试" in out.content and "查询" in out.content
+    assert _body(out) == u.TOOL_RESULT_UNKNOWN.format(name="slow_write")
+    assert "禁止重试" in _body(out) and "查询" in _body(out)
     assert events.types("s-1") == ["tool_call", "tool_error"]
     assert events.rows[1]["payload"]["error"] == u.TOOL_ERROR_TIMEOUT_UNKNOWN
     assert ctx.tool_health.fail_streaks == {} and no_retry_sleep == []
@@ -380,9 +411,7 @@ async def test_read_timeout_final_error_counts_streak(no_retry_sleep):
 
     ctx, events, rt = _harness(ToolRegistry([slow_read]))
     out = await _call(rt, _request(rt, "slow_read", {}))
-    assert out.status == "error" and out.content == u.TOOL_TIMEOUT.format(
-        timeout_s=0.05
-    )
+    assert out.status == "error" and _body(out) == u.TOOL_TIMEOUT.format(timeout_s=0.05)
     assert events.rows[1]["payload"]["error"] == u.TOOL_ERROR_TIMEOUT.format(
         timeout_s=0.05
     )
@@ -419,7 +448,7 @@ async def test_write_exception_is_single_attempt(no_retry_sleep):
 
     _, events, rt = _harness(ToolRegistry([boom_write]))
     out = await _call(rt, _request(rt, "boom_write", {}))
-    assert out.status == "error" and out.content == u.TOOL_FAILED.format(
+    assert out.status == "error" and _body(out) == u.TOOL_FAILED.format(
         detail="下游拒绝"
     )
     assert calls["n"] == 1 and no_retry_sleep == []
@@ -437,7 +466,7 @@ async def test_stricter_timeout_wins():
         ToolRegistry([optimistic]), policy=LoopPolicy(tool_step_timeout_s=0.05)
     )
     out = await _call(rt, _request(rt, "optimistic", {}))
-    assert out.content == u.TOOL_TIMEOUT.format(timeout_s=0.05)
+    assert _body(out) == u.TOOL_TIMEOUT.format(timeout_s=0.05)
 
 
 # ---------------------------------------------------------------- ⑦ 连败禁用
@@ -448,10 +477,10 @@ async def test_two_failures_disable_tool_for_run():
     bad = {"order_id": "1", "extra": 1}
     first = await _call(rt, _request(rt, "demo_order_query", bad, "c1"))
     second = await _call(rt, _request(rt, "demo_order_query", bad, "c2"))
-    assert not first.content.endswith(u.TOOL_STREAK_DISABLED.format(streak=1))
-    assert second.content.endswith(u.TOOL_STREAK_DISABLED.format(streak=2))
+    assert not _body(first).endswith(u.TOOL_STREAK_DISABLED.format(streak=1))
+    assert _body(second).endswith(u.TOOL_STREAK_DISABLED.format(streak=2))
     third = await _call(rt, _request(rt, "demo_order_query", {"order_id": "1"}, "c3"))
-    assert third.content == u.TOOL_DISABLED.format(name="demo_order_query", limit=2)
+    assert _body(third) == u.TOOL_DISABLED.format(name="demo_order_query", limit=2)
     assert events.rows == [] and ctx.tool_health.disabled == {"demo_order_query"}
 
 
@@ -469,7 +498,7 @@ async def test_success_resets_fail_streak_and_streak_is_per_tool_and_per_run():
     fresh_ctx, _, fresh_rt = _harness(build_registry())  # 新 run：新账本
     assert fresh_ctx.tool_health.fail_streaks == {}
     out = await _call(fresh_rt, _request(fresh_rt, "demo_order_query", {"x": 1}, "c5"))
-    assert "本轮已禁用" not in out.content
+    assert "本轮已禁用" not in _body(out)
 
 
 # ---------------------------------------------------------------- ⑥ 结果规范化
@@ -494,7 +523,7 @@ def _digest_gateway(*acts: list[Any]) -> Any:
 async def test_small_result_passes_through_without_injected():
     _, events, rt = _harness(ToolRegistry([small_read]), gateway=_digest_gateway())
     out = await _call(rt, _request(rt, "small_read", {}))
-    assert out.content == '{"status": "已发货", "eta": "明天"}'
+    assert _body(out) == '{"status": "已发货", "eta": "明天"}'
     payload = events.rows[1]["payload"]
     assert "injected" not in payload and "normalization" not in payload
 
@@ -508,10 +537,10 @@ async def test_over_budget_uses_fast_tier_digest_and_keeps_raw():
     )
     out = await _call(rt, _request(rt, "big_read", {}))
     assert out.status == "success"
-    assert out.content == u.TOOL_SUMMARY_PREFIX + "共 200 条订单数据，全部已发货"
+    assert _body(out) == u.TOOL_SUMMARY_PREFIX + "共 200 条订单数据，全部已发货"
     payload = events.rows[1]["payload"]
     assert len(payload["result"]["rows"]) == 200  # 原文一条不少
-    assert payload["injected"] == out.content and payload["normalization"] == "summary"
+    assert payload["injected"] == _body(out) and payload["normalization"] == "summary"
 
 
 async def test_digest_gateway_failure_fails_open_to_truncation():
@@ -522,8 +551,8 @@ async def test_digest_gateway_failure_fails_open_to_truncation():
         context_config=ContextConfig(tool_results_budget=100),
     )
     out = await _call(rt, _request(rt, "big_read", {}))
-    assert out.status == "success" and out.content.endswith(u.CLIP_SUFFIX)
-    assert estimate_tokens(out.content) < 200
+    assert out.status == "success" and _body(out).endswith(u.CLIP_SUFFIX)
+    assert estimate_tokens(_body(out)) < 200
     payload = events.rows[1]["payload"]
     assert payload["normalization"] == "truncated" and "summarize_error" in payload
 
@@ -533,7 +562,7 @@ async def test_no_gateway_truncates_deterministically():
         ToolRegistry([big_read]), context_config=ContextConfig(tool_results_budget=100)
     )
     out = await _call(rt, _request(rt, "big_read", {}))
-    assert out.content.endswith(u.CLIP_SUFFIX)
+    assert _body(out).endswith(u.CLIP_SUFFIX)
     payload = events.rows[1]["payload"]
     assert payload["normalization"] == "truncated" and "summarize_error" not in payload
 
@@ -546,10 +575,10 @@ async def test_oversized_digest_gets_truncated_too():
         context_config=ContextConfig(tool_results_budget=100),
     )
     out = await _call(rt, _request(rt, "big_read", {}))
-    assert out.content.startswith(u.TOOL_SUMMARY_PREFIX) and out.content.endswith(
+    assert _body(out).startswith(u.TOOL_SUMMARY_PREFIX) and _body(out).endswith(
         u.CLIP_SUFFIX
     )
-    assert estimate_tokens(out.content) < 200
+    assert estimate_tokens(_body(out)) < 200
     assert events.rows[1]["payload"]["normalization"] == "summary"
 
 
@@ -614,7 +643,7 @@ async def test_cancel_at_tool_checkpoint_discards_remaining_calls_with_single_wr
     tool_msgs = {
         m.tool_call_id: m for m in snap.values["messages"] if isinstance(m, ToolMessage)
     }
-    assert tool_msgs["c1"].content == "ok"
+    assert _body(tool_msgs["c1"]) == "ok"
     assert (
         tool_msgs["c2"].content == u.TOOL_CANCELLED
         and tool_msgs["c3"].content == u.TOOL_CANCELLED
@@ -622,6 +651,137 @@ async def test_cancel_at_tool_checkpoint_discards_remaining_calls_with_single_wr
     assert not isinstance(
         snap.values["messages"][-1], AIMessage
     )  # 取消零话术：不追加兜底
+
+
+async def test_serializer_does_not_wait_for_calls_paired_by_after_model_hooks(
+    monkeypatch,
+):
+    """发现 F7（M2.7 修）：同一轮 [幻觉名 c1, 真调用 c2]——c1 被 Gates 配对、永不进 tools；c2 的串行器不能等 c1，否则死锁。"""
+    _m27()
+    monkeypatch.undo()  # 真图里用真实任务身份（钉死的任务 id 会让第二轮事件被当作重放去重）
+    spec = AgentSpec(
+        system_prompt="你是演示客服。",
+        model_tier="fast",
+        tools=build_registry().specs(),
+    )
+    rt, cand, _events, sessions = make_runtime(
+        tool_turn(
+            ("ghost_tool", {}, "c1"),
+            ("demo_order_query", {"order_id": "1024"}, "c2"),
+        ),
+        text_turn("查到了"),
+    )
+    await sessions.create("s-1", tenant_id="t-a", user_id="u-1")
+    got = await asyncio.wait_for(
+        collect(rt, tenant_id="t-a", session_id="s-1", user_input="查", spec=spec),
+        timeout=10,
+    )
+    assert [e.type.value for e in got] == [
+        "user_message",
+        "llm_call",
+        "llm_result",
+        "tool_call",
+        "tool_result",
+        "llm_call",
+        "llm_result",
+        "assistant_message",
+        "loop_terminated",
+    ]
+    assert got[3].payload["model_call_id"] == "c2" and cand.calls == 2
+    snap = await rt.build_agent("t-a", spec).aget_state(
+        {"configurable": {"thread_id": "s-1"}}
+    )
+    tool_msgs = {
+        m.tool_call_id: m for m in snap.values["messages"] if isinstance(m, ToolMessage)
+    }
+    assert tool_msgs["c1"].content.startswith("工具 ghost_tool 不存在")
+    assert "已发货" in tool_msgs["c2"].content
+
+
+# ---------------------------------------------------------------- ③′ 通行证：前置校验挂点与审批单回填（M2.7）
+
+
+async def test_precheck_veto_writes_event_and_skips_write_ahead():
+    """TOCTOU 挂点：持通行证者执行前重跑业务校验——否决即 precheck_vetoed 事件（detail 只进事件）、不进 write-ahead、不记连败账。"""
+    _m27()
+
+    async def precheck(name: str, args: Any) -> Any:
+        from app.engine.runtime.tools import PrecheckVeto
+
+        return PrecheckVeto(observation="订单已关闭", detail="status=closed")
+
+    ctx, events, rt = _harness(build_registry(), precheck=precheck)
+    out = await _call(
+        rt,
+        _request(
+            rt, "demo_refund_apply", {"order_id": "1", "amount": 350}, approved=("c1",)
+        ),
+    )
+    assert out.status == "error"
+    assert _body(out) == u.PRECHECK_VETO_TEMPLATE.format(reason="订单已关闭")
+    assert "status=closed" not in _body(out)
+    assert events.types("s-1") == ["precheck_vetoed"]
+    assert events.rows[0]["payload"] == {
+        "approval_id": "ap-c1",
+        "tool_name": "demo_refund_apply",
+        "observation": "订单已关闭",
+        "detail": "status=closed",
+    }
+    assert ctx.tool_health.fail_streaks == {}
+
+
+async def test_precheck_only_consulted_with_passport_and_pass_executes():
+    _m27()
+    consulted: list[tuple[str, dict[str, Any]]] = []
+
+    async def precheck(name: str, args: Any) -> Any:
+        consulted.append((name, dict(args)))
+        return None
+
+    _, events, rt = _harness(build_registry(), precheck=precheck)
+    await _call(
+        rt, _request(rt, "demo_order_query", {"order_id": "1"})
+    )  # 无通行证的读工具：不问
+    out = await _call(
+        rt,
+        _request(
+            rt,
+            "demo_refund_apply",
+            {"order_id": "1", "amount": 350},
+            "c2",
+            approved=("c2",),
+        ),
+    )
+    assert out.status == "success"
+    assert consulted == [("demo_refund_apply", {"order_id": "1", "amount": 350})]
+    assert events.types("s-1") == ["tool_call", "tool_result"] * 2
+
+
+async def test_write_ahead_backfills_approval_event_id_exactly_once():
+    """批准已兑现的凭证：write-ahead 之后把 tool_call 事件 id 回填审批单；重放二次进入不覆盖。"""
+    _m27()
+    approvals = MemoryApprovalStore()
+    aid = str(uuid.uuid4())
+    await approvals.create(
+        approval_id=aid,
+        tenant_id="t-a",
+        session_id="s-1",
+        run_id="r-1",
+        tool_name="demo_refund_apply",
+        args={"order_id": "1", "amount": 350},
+        ttl_s=60,
+    )
+    _, events, rt = _harness(build_registry(), approvals=approvals)
+    request = _request(
+        rt, "demo_refund_apply", {"order_id": "1", "amount": 350}, approved={"c1": aid}
+    )
+    first = await _call(rt, request)
+    assert first.status == "success"
+    assert approvals.rows[aid]["event_id"] == events.rows[0]["id"]
+    second = await _call(rt, request)  # 重放：同一把钥匙、回填不变
+    assert second.content == first.content
+    assert approvals.rows[aid]["event_id"] == events.rows[0]["id"]
+    assert events.types("s-1") == ["tool_call", "tool_result"]
 
 
 async def test_cancelled_call_returns_command_once_then_plain_messages():

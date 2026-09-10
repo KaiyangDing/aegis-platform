@@ -54,3 +54,11 @@
 - 前作的 `reexecute` 窄入口（跳过校验与闸门）在本仓坍缩为同一条路径：同参数同通行证下重跑校验与闸门无害；"恢复期工具缺失"由执行前的注册表查询兜底回填。
 - 实证：工具副作用之后以 BaseException 中断（checkpoint 停在 tools 之前）→ `astream(None)` 恢复 → 事件恰九条无重复、结果以原 id 闭合、下游只见一把钥匙、副作用执行两次（框架重放整节点）；直连 wrap 二次进入同任务身份 → 无第二条 `tool_call`。由 `tests/engine/runtime/test_runtime_tool_exec.py` 钉住。
 - 摘要事件（M2.6）同样派生自 before_model 节点的任务身份：崩溃发生在"事件已写、节点未完成"的窗口时，重放会得到另一份摘要文本而事件保留首次文本——保事实不保字节，恢复分诊时复核。
+
+## 增补（M2.9，2026-09-08）：恢复分诊与图外事件
+
+- 决策 4 在模型节点上的形态：崩溃发生在 `llm_call` 已提交、节点未完成的窗口，重放进入 wrap 时 `llm_call` 派生同 id 去重命中——这就是"半截 LLM"的判据，不扫事件表；处置是补配对 `llm_result(interrupted, cause=replay)`（旧结果其实已落盘时被同 id 去重吸收）再以下一序号重发，显式接受重生成文本不同。"事件领先一步"因此在三类节点上各有闭合方式：工具 = 原键重执行（M2.5）、模型 = 作废重发、after_agent = 末事件去重。
+- 决策 3 的图外事件派生规则：没有框架任务身份的写入（恢复放弃 `recovery_abandoned`）以本次恢复的 run_id 顶替任务段——`uuid5(命名空间, [session_id, run_id, "recovery_abandoned", 0])`，行上 `task_id / checkpoint_id` 为空；每次放弃各一条。
+- 恢复分诊只看两样事实：会话行的 run_state 与 checkpoint 的 `next` / 挂起点；不读事件表扫描。健康挂起（审批单仍 pending）不计恢复次数；`next` 为空只修状态。
+- 实证（真 PG，`durability="sync"`）：工具副作用之后中断 → 恢复 → events 九行、seq 连续、id 唯一、每行带任务 id、`tool_result` 以原 id 闭合、下游一把钥匙（副作用两次）；模型返回之后、`llm_result` 落盘之前中断 → 恢复 → 七行、第一次调用闭合为 interrupted / replay、第二次 iteration=2。记录见 `reports/2026-09-08-recovery.md`。
+- 登记：langchain-core 1.6.1 `agenerate` 把候选抛出的非 Exception 的 BaseException 当成功结果处理（AttributeError 穿出）——模拟"模型调用期崩溃"须在事件存取件注入；无锁世界的并发恢复会双执行副作用并让一方 checkpoint 写入冲突（会话锁归后续里程碑）。

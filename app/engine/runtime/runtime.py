@@ -1,11 +1,16 @@
-"""AgentRuntime 门面（M2.3；M2.4 插入 Gates、接取消信号；M2.5 网关句柄进 RunContext；M2.6 插入 AegisSummarization、栈经 build_middleware 注入依赖）：
+"""AgentRuntime 门面（M2.3；M2.4 插入 Gates、接取消信号；M2.5 网关句柄进 RunContext；M2.6 插入 AegisSummarization、栈经 build_middleware
+注入依赖；M2.7 插入 Approvals、resume() 审批续跑单入口、审批单存取件与前置校验挂点进 RunContext）：
 按 (tenant_id, spec 指纹) 编译并缓存图；run() 单入口驱动一次循环、事件按 seq 序外流。
 
 一次 run（ADR-011 / 012）：读会话行取身份并核对租户归属 → D8 种子（历史 llm_call / llm_result 的估算字段求和）→
 T1 idle→running（CAS 失败 = 会话正忙）→ agent.astream(..., durability="sync", recursion_limit=推导, stream_mode=["custom"])
 → 钩子内落盘的事件经 stream_writer 到达这里逐条 yield。
 图缓存：编译成本按租户 spec 摊销；指纹覆盖注入面全部会影响图形态的字段（工具 schema 含在内），改 spec 即换图。
-resume（审批续跑 / 崩溃恢复单入口）随 M2.7 / M2.9。
+resume（ADR-013 决策 3 / 6）：审批续跑与崩溃恢复同一入口 = 从最后一个 checkpoint 之后重放；approval_id 非 None = 计划内审批续跑，
+None = 崩溃恢复（前作 resume(spec, session_id, approval_id=None) 同一分野；M2 无会话锁，"运行中的会话是不是死了"只能由调用方断言）。
+M2.7 接审批续跑：会话必须在 awaiting_approval → 取挂起点（缺失即先重放到挂起点）→ approval_id 属于挂起载荷 → 载荷里的审批单全部终态才放行
+（仍 pending → ValueError）→ T3 awaiting→running（CAS 输家 = 并发恢复 → SessionBusy）→ Command(resume={"decisions": […]}) 从挂起节点重放；
+决定数恒等于挂起数、决定由审批表终态翻译而来——这就是 API 层形态守卫的落点。崩溃恢复分诊随 M2.9 补进同一入口。
 """
 
 import hashlib
@@ -21,14 +26,18 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.types import Command
 
 from app.engine.runtime.events import AgentEvent, EventType
+from app.engine.runtime.middleware.approvals import Approvals
 from app.engine.runtime.middleware.gates import Gates
 from app.engine.runtime.middleware.model_call import ModelCall
 from app.engine.runtime.middleware.run_events import RunEvents
 from app.engine.runtime.middleware.summarization import AegisSummarization
 from app.engine.runtime.middleware.tool_exec import ToolExec
 from app.engine.runtime.protocols import (
+    ApprovalStatus,
+    ApprovalStoreLike,
     CancelSignal,
     EventStoreLike,
     SessionRunState,
@@ -36,17 +45,19 @@ from app.engine.runtime.protocols import (
 )
 from app.engine.runtime.spec import AgentSpec, LoopPolicy
 from app.engine.runtime.state import RunContext
-from app.engine.runtime.tools import ToolRegistry, to_structured_tools
+from app.engine.runtime.tools import PrecheckHook, ToolRegistry, to_structured_tools
 
 MIDDLEWARE_STACK: tuple[type[AgentMiddleware], ...] = (
     RunEvents,
     AegisSummarization,
+    Approvals,
     Gates,
     ModelCall,
     ToolExec,
 )
-"""栈序即语义（ADR-012 决策 1）。M2.6 形态：before_model 按列表序 = 压缩 → 闸门；after_model 反序 = 闸门先于（M2.7 插在
-AegisSummarization 与 Gates 之间的）审批；Guards 随 M2.8 插到 RunEvents 之后。build_middleware 与本元组一一对应（静态测试互钉）。"""
+"""栈序即语义（ADR-012 决策 1）。M2.7 形态：before_model 按列表序 = 压缩 → 闸门；after_model 反序 = 闸门（#5 / #4）先于审批，
+闸门终止的 jump end 绕过审批；Approvals 是列表首个 after_model = 循环出口节点。Guards 随 M2.8 插到 RunEvents 之后。
+build_middleware 与本元组一一对应（静态测试互钉）。"""
 
 _HOOKS_PER_PHASE = {
     "before_agent": ("before_agent", "abefore_agent"),
@@ -57,7 +68,7 @@ _HOOKS_PER_PHASE = {
 
 
 class SessionBusy(RuntimeError):
-    """T1 CAS 失败：会话不在 idle（另一 run 在跑或挂起等审批）。M3 翻译为 409。"""
+    """CAS 失败：会话不在期望的状态（另一 run 在跑 / 挂起等审批 / 并发恢复已有赢家）。M3 翻译为 409。"""
 
 
 def build_middleware(gateway: BaseChatModel, spec: AgentSpec) -> list[AgentMiddleware]:
@@ -66,6 +77,7 @@ def build_middleware(gateway: BaseChatModel, spec: AgentSpec) -> list[AgentMiddl
     return [
         RunEvents(),
         AegisSummarization(gateway, config=spec.context_config),
+        Approvals(),
         Gates(),
         ModelCall(),
         ToolExec(),
@@ -90,6 +102,7 @@ def recursion_limit_for(
     最长路径 = 工具循环撞 max_iterations：before_agent 节点 + max_iterations × (before_model 节点 + model + after_model 节点 + tools)
     + 终止那一遍的 before_model 节点（Gates 在此 jump end）+ after_agent 节点。对这条路径公式精确（余量 0）；
     文本完成等更短的路径自然有余量。栈里没有 before_model 钩子时公式对该路径少算一个节点（M2.3 形态的已知缺口，Gates 入栈后消失）。
+    恢复（resume）从挂起点重新计数：框架的步数上限相对本次调用的起点。
     """
     per_iteration = (
         _hook_count(middleware, "before_model")
@@ -139,7 +152,10 @@ def spec_fingerprint(spec: AgentSpec) -> str:
 
 
 class AgentRuntime:
-    """对外门面：一次 run = 一条事件流；图按 (tenant_id, spec 指纹) LRU 缓存；网关按租户装配（组合根注入闭包）。"""
+    """对外门面：一次 run = 一条事件流；图按 (tenant_id, spec 指纹) LRU 缓存；网关按租户装配（组合根注入闭包）。
+
+    approvals=None 是无审批的单元测试形态（风险闸门命中即 RuntimeError）；precheck=None = 批准后前置校验全通过（M3 注入真实校验）。
+    """
 
     def __init__(
         self,
@@ -148,12 +164,16 @@ class AgentRuntime:
         events: EventStoreLike,
         sessions: SessionStateLike,
         checkpointer: BaseCheckpointSaver,
+        approvals: ApprovalStoreLike | None = None,
+        precheck: PrecheckHook | None = None,
         cache_size: int = 64,
     ) -> None:
         self._gateway_for = gateway_for
         self._events = events
         self._sessions = sessions
         self._checkpointer = checkpointer
+        self._approvals = approvals
+        self._precheck = precheck
         self._cache_size = cache_size
         self._agents: OrderedDict[tuple[str, str], Any] = OrderedDict()
 
@@ -190,6 +210,60 @@ class AgentRuntime:
                 )
         return seed
 
+    async def _owned_session(self, tenant_id: str, session_id: str) -> dict[str, Any]:
+        """起跑 / 恢复前的归属校验：会话行不存在或不属于该租户 → ValueError。"""
+        row = await self._sessions.get(session_id)
+        if row is None:
+            raise ValueError(f"会话 {session_id} 不存在——run 之前必须先建 sessions 行")
+        if row["tenant_id"] != tenant_id:
+            raise ValueError(f"会话 {session_id} 不属于租户 {tenant_id}")
+        return row
+
+    def _context(
+        self,
+        row: dict[str, Any],
+        spec: AgentSpec,
+        *,
+        cancel: CancelSignal | None,
+        token_seed: int,
+    ) -> RunContext:
+        """每次调用一份载体（新 run_id：恢复的事件带新 run_id、seq 接续旧流）。"""
+        return RunContext(
+            tenant_id=row["tenant_id"],
+            user_id=row["user_id"],
+            session_id=row["id"],
+            run_id=uuid.uuid4().hex,
+            spec=spec,
+            registry=ToolRegistry(spec.tools),
+            events=self._events,
+            sessions=self._sessions,
+            token_seed=token_seed,
+            cancel=cancel,
+            gateway=self._gateway_for(
+                row["tenant_id"]
+            ),  # 增强层（工具结果摘要）的 fast 档入口，与图内模型同一租户绑定
+            approvals=self._approvals,
+            precheck=self._precheck,
+        )
+
+    @staticmethod
+    def _config(session_id: str, spec: AgentSpec) -> dict[str, Any]:
+        return {
+            "configurable": {"thread_id": session_id},
+            "recursion_limit": recursion_limit_for(spec.policy),
+        }
+
+    @staticmethod
+    async def _drive(
+        agent: Any, payload: Any, config: dict[str, Any], ctx: RunContext
+    ) -> AsyncIterator[AgentEvent]:
+        """驱动图：只订阅 custom 帧（事件），durability=sync（ADR-011 决策 2）。挂起（interrupt）时流干净结束、不外流中断对象（探针⒅）。"""
+        async for _mode, frame in agent.astream(
+            payload, config, context=ctx, stream_mode=["custom"], durability="sync"
+        ):
+            if isinstance(frame, AgentEvent):
+                yield frame
+
     async def run(
         self,
         *,
@@ -201,15 +275,13 @@ class AgentRuntime:
     ) -> AsyncIterator[AgentEvent]:
         """驱动一次完整循环；产出事件 ≡ 本 run 落盘事件，yield 序 ≡ seq 序。
 
-        会话行不存在 / 不属于该租户 → ValueError（起跑前的归属校验）；不在 idle → SessionBusy。
+        会话行不存在 / 不属于该租户 → ValueError（起跑前的归属校验）；不在 idle（运行中 / 挂起等审批）→ SessionBusy——
+        挂起态的新输入不许进图（探针⒆：新输入会作废挂起、留悬空 tool_calls），会话互斥在这里前置。
         cancel 是闸门 #6 的取消源（None = 无取消源）。
         run 内异常（ProviderError 泄漏、事实源不可用、system 超预算）裸穿，run_state 留在 running——由恢复路径（M2.9）分诊。
+        审批挂起时本流在 approval_requested 之后干净结束（无 loop_terminated），run_state = awaiting_approval。
         """
-        row = await self._sessions.get(session_id)
-        if row is None:
-            raise ValueError(f"会话 {session_id} 不存在——run 之前必须先建 sessions 行")
-        if row["tenant_id"] != tenant_id:
-            raise ValueError(f"会话 {session_id} 不属于租户 {tenant_id}")
+        row = await self._owned_session(tenant_id, session_id)
         token_seed = await self._token_seed(tenant_id, session_id)
         if not await self._sessions.transition(
             session_id,
@@ -217,39 +289,103 @@ class AgentRuntime:
             to=SessionRunState.RUNNING.value,
         ):
             raise SessionBusy(f"会话 {session_id} 不在 idle：当前 {row['run_state']}")
-        ctx = RunContext(
-            tenant_id=tenant_id,
-            user_id=row["user_id"],
-            session_id=session_id,
-            run_id=uuid.uuid4().hex,
-            spec=spec,
-            registry=ToolRegistry(spec.tools),
-            events=self._events,
-            sessions=self._sessions,
-            token_seed=token_seed,
-            cancel=cancel,
-            gateway=self._gateway_for(
-                tenant_id
-            ),  # 增强层（工具结果摘要）的 fast 档入口，与图内模型同一租户绑定
-        )
+        ctx = self._context(row, spec, cancel=cancel, token_seed=token_seed)
         agent = self.build_agent(tenant_id, spec)
-        config = {
-            "configurable": {"thread_id": session_id},
-            "recursion_limit": recursion_limit_for(spec.policy),
-        }
-        async for _mode, payload in agent.astream(
+        async for event in self._drive(
+            agent,
             {"messages": [HumanMessage(user_input)]},
-            config,
-            context=ctx,
-            stream_mode=["custom"],
-            durability="sync",
+            self._config(session_id, spec),
+            ctx,
         ):
-            if isinstance(payload, AgentEvent):
-                yield payload
+            yield event
+
+    async def _decisions(self, interrupts: Sequence[Any]) -> list[dict[str, Any]]:
+        """审批表终态 → 决定列表（借 HITL 决定形态）。决定数恒等于挂起数；单不存在或仍 pending → ValueError（先 decide / cancel / expire_due）。"""
+        if self._approvals is None:
+            raise RuntimeError(
+                "恢复审批需要审批单存取件（AgentRuntime(approvals=...)）"
+            )
+        decisions: list[dict[str, Any]] = []
+        for pending in interrupts:
+            for request in pending.value.get("action_requests", ()):
+                ticket = await self._approvals.get(request["approval_id"])
+                if ticket is None:
+                    raise ValueError(
+                        f"审批单 {request['approval_id']} 不存在——挂起载荷与审批表不一致"
+                    )
+                if ticket["status"] == ApprovalStatus.PENDING:
+                    raise ValueError(
+                        f"审批单 {ticket['id']} 仍是 pending——先 decide / cancel / expire_due 再 resume"
+                    )
+                decisions.append(
+                    {
+                        "type": "approve"
+                        if ticket["status"] == ApprovalStatus.APPROVED
+                        else "reject",
+                        "approval_id": ticket["id"],
+                        "status": ticket["status"],
+                    }
+                )
+        return decisions
+
+    @staticmethod
+    async def _pending_interrupts(agent: Any, config: dict[str, Any]) -> list[Any]:
+        """checkpoint 里 pending 的中断（挂起点）；没有即空列表。"""
+        snapshot = await agent.aget_state(config)
+        return [i for task in snapshot.tasks for i in task.interrupts]
 
     async def resume(
-        self, *, tenant_id: str, session_id: str, spec: AgentSpec
+        self,
+        *,
+        tenant_id: str,
+        session_id: str,
+        spec: AgentSpec,
+        approval_id: str | None = None,
+        cancel: CancelSignal | None = None,
     ) -> AsyncIterator[AgentEvent]:
-        """恢复单入口（审批续跑 / 崩溃恢复同路径）：M2.7 / M2.9 实装。"""
-        raise NotImplementedError("resume 随 M2.7（审批）/ M2.9（崩溃恢复）实装")
-        yield  # 保持 async generator 形态
+        """恢复单入口（审批续跑 / 崩溃恢复同路径）。approval_id 是调用方意图（前作同一分野）：非 None = 计划内审批续跑
+        （坐席刚对这张单落下决定）；None = 崩溃恢复（调用方断言上一进程已死；分诊随 M2.9）。
+
+        审批续跑：会话必须在 awaiting_approval（否则 SessionBusy：并发恢复已有赢家或会话在跑）；挂起点缺失 = T2 之后、挂起
+        checkpoint 之前崩过 → 先以 None 重放到挂起点（Approvals 每步幂等：单命中、事件去重、T2 跳过），再取挂起点；approval_id
+        必须属于挂起载荷（否则 ValueError）；载荷里的审批单全部终态才放行（仍 pending → ValueError：先 decide / cancel / expire_due）
+        → T3 CAS awaiting→running（输家 SessionBusy）→ Command(resume={"decisions": […]}) 从挂起节点重放。
+        产出 = 恢复段新落盘的事件（重放去重命中的旧事件不再外流）。
+        """
+        row = await self._owned_session(tenant_id, session_id)
+        if approval_id is None:
+            raise NotImplementedError("崩溃恢复分诊随 M2.9 实装（M2.7 只接审批续跑）")
+        if row["run_state"] != SessionRunState.AWAITING_APPROVAL.value:
+            raise SessionBusy(
+                f"会话 {session_id} 不在 awaiting_approval（当前 {row['run_state']}）：并发恢复已有赢家或会话在跑"
+            )
+        agent = self.build_agent(tenant_id, spec)
+        config = self._config(session_id, spec)
+        ctx = self._context(row, spec, cancel=cancel, token_seed=0)
+        interrupts = await self._pending_interrupts(agent, config)
+        if not interrupts:
+            async for event in self._drive(agent, None, config, ctx):
+                yield event  # 重放到挂起点通常零新事件（全部去重命中）
+            interrupts = await self._pending_interrupts(agent, config)
+            if not interrupts:
+                raise RuntimeError(
+                    f"会话 {session_id} 在 awaiting_approval 但重放后仍无挂起点——事实源不一致"
+                )
+        requested = {
+            request["approval_id"]
+            for pending in interrupts
+            for request in pending.value.get("action_requests", ())
+        }
+        if approval_id not in requested:
+            raise ValueError(f"审批单 {approval_id} 不属于会话 {session_id} 的挂起点")
+        decisions = await self._decisions(interrupts)
+        if not await self._sessions.transition(
+            session_id,
+            expected=SessionRunState.AWAITING_APPROVAL.value,
+            to=SessionRunState.RUNNING.value,
+        ):
+            raise SessionBusy(f"会话 {session_id} 的恢复已有并发赢家")
+        async for event in self._drive(
+            agent, Command(resume={"decisions": decisions}), config, ctx
+        ):
+            yield event

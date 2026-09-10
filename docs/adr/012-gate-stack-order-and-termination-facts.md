@@ -73,3 +73,22 @@
 - 通道单写者纪律把按调用的账本推到进程内对象：连败禁用不跨崩溃恢复（前作同款）；取消检查点的终止事实由首个被弃置的调用承担。
 - 终止时 state 里多出配对的"未执行"ToolMessage 与兜底 AIMessage：下一轮 prompt 由编译器裁剪，checkpoint 里它们永久存在。
 - 摘要触发按 state 全量计、编译按压缩后计，两把尺同口径不同对象；重放窗口内摘要文本可能与事件里的首次文本不同（保事实不保字节）。
+
+## 增补（M2.7–M2.9，2026-09-08）
+
+- **决策 1 定稿**：七件栈 `[RunEvents, Guards, AegisSummarization, Approvals, Gates, ModelCall, ToolExec]`。判据①补充：入口守卫排在首事件之后（首事件之前不许有守卫插队），HIGH 拒答跳 end 直达 after_agent（before_agent 声明 `can_jump_to` 即得条件边，after_agent 仍运行，末事件照写）；判据②实证：闸门终止的跳 end 绕过审批钩子——不开单、不翻转。Approvals 是列表首个 after_model = 循环出口节点，出边是模型→工具边（返回通行证时未配对调用直送 tools）。`recursion_limit` 推导式对七件栈 = 6·max_iterations + 6。
+- **决策 7 增补（发现 F7）**：串行器只等"会进 tools 的前驱"——被 after_model 钩子配对的调用（闸门打断 / 幻觉名 / 审批谓词崩溃）永不进 tools，等它即死锁；混合轮 `[幻觉名, 真调用]` 触发。M2.5 潜在缺陷，M2.7 修，回归钉住。
+- **决策 10 增补**：守卫话术（拒答 / 打标 / 分类指令 / 不可信声明 / 安全回复）同源 utterances；出口守卫在 wrap 内替换后的 AIMessage 打 `GUARDRAIL_TRUNCATED` 标记，`assistant_message` 事件标 `guardrail_truncated`，`llm_result` 保留模型原文供审计。
+- **决策 14（新）：守卫三段自建**。`PIIMiddleware` 不用（无本人数据允许清单）。入口：规则库无条件底座 + 按租户开通的 fast 档分类器（经租户网关、内部调用打标），综合裁决只抬不压、输出严格白名单解析；fail-open 只接网关六类公开异常与不可解析（ValueError），ProviderError 泄漏裸炸；MEDIUM 打标进 `entry_notice` 私有通道、由编译器拼入 system 层（本 run 有效，不进 state 消息）；HIGH 拒答以 COMPLETED 收尾（防线不是第七道闸门）。包裹：五结局 ToolMessage 一律 `wrap_untrusted`，伪造边界标记改写，事件存原文。出口：OutputGuard 逐字符 ≡ 整段的确定性状态机，整段 feed + flush + final_check 接线（真流式归 M3），命中即止损、终局整条替换；工具轮前置文本命中只审计不补话术。分类器 deadline 不低于网关一次尝试的下限（`min_attempt_budget`），否则永远 fail-open。
+- **决策 15（新）：崩溃恢复 = 重放 + 去重**（前作四支分诊坍缩）。分诊只看会话行与 checkpoint：idle / failed 无可恢复；挂起点在且审批单仍 pending = 健康挂起（零事件、不计次）；`recovery_count` +1 超上限 → T5 →failed + `recovery_abandoned` 图外事件；挂起点在且单已终态 → 与审批续跑同路径；`next` 为空 → 只修状态；其余 → `astream(None)` 重放。半截 LLM 的判据 = `llm_call` 派生 id 去重命中 → 补 `llm_result(interrupted, cause=replay)` 再以下一序号重发（消耗迭代）；半截工具 = write-ahead 去重原键重执行；after_agent 重放 = 末事件去重 + T4。M2 无租约，"运行中的会话是不是死了"由恢复调用方断言（`resume(approval_id=None)`）。
+
+### 实证（M2.7–M2.9）
+
+- 审批：循环出口 after_model 内 `interrupt()`——挂起四事件后干净结束、`next` 指向审批节点、run_state=awaiting；resume 同节点重放且任务 id 相同、返回值原样；一个节点只放一个 interrupt；挂起态新输入作废中断留悬空调用（会话互斥前置）；闸门终止绕过审批。由 `tests/engine/runtime/test_runtime_approvals.py`（26）、`tests/domain/test_approvals.py`（12，真 PG）、`test_runtime_pg.py` 真 PG 十一事件钉住。
+- 守卫：before_agent 跳 end 后模型零调用、after_agent 仍运行；未声明静默无效；wrap 替换后 state 只有替换版；分类器 deadline 7.5s 撞网关 8s 下限即首块预算耗尽。由 `test_guards.py`（57）、`test_runtime_guards.py`（14）钉住。
+- 恢复：三处 BaseException 崩溃点的 `next` 形态与重放节点（model / after_agent / after_model 在 interrupt 前）任务 id 均与首次相同；无锁并发恢复双副作用 + 一方 checkpoint 写入冲突；候选里抛 BaseException 被 langchain-core `agenerate` 当成功结果取 `.generations`（AttributeError）——模型侧崩溃注入改在 llm_result 落盘之前。由 `test_runtime_recovery.py`（13，含真 PG 两条）钉住；演示记录 `reports/2026-09-08-recovery.md`。
+
+### 后果（增补）
+
+- 七件栈定稿后 `recursion_limit` 最长路径 = 6M + 6；每轮多两个钩子节点（守卫只在外圈一次）。
+- `langchain-core` 对非 Exception 的 BaseException 的处理是升级复核项；本仓闸门 #6 走信号检查点而不靠取消异常，M3 客户端断连（CancelledError）语义须探针复核。

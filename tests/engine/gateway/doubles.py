@@ -45,6 +45,9 @@ class ScriptedCandidate(BaseChatModel):
     calls: int = 0
     closed: int = 0
     seen_kwargs: list[dict[str, Any]] = Field(default_factory=list)
+    seen_messages: list[list[Any]] = Field(
+        default_factory=list
+    )  # 每次调用收到的 prompt（守卫 / 编译测试看这里）
 
     @property
     def _llm_type(self) -> str:
@@ -62,6 +65,7 @@ class ScriptedCandidate(BaseChatModel):
     ) -> AsyncIterator[ChatGenerationChunk]:
         self.calls += 1
         self.seen_kwargs.append({**kwargs, "stop": stop})
+        self.seen_messages.append(list(messages))
         act = self.acts[min(self.calls, len(self.acts)) - 1]
         try:
             for item in act:

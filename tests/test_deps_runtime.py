@@ -1,4 +1,4 @@
-"""组合根的运行时装配（M2.3）：RuntimeParts → AgentRuntime，网关按租户由闭包装配、图按租户 spec 编译。"""
+"""组合根的运行时装配（M2.3；M2.7 加审批单存取件）：RuntimeParts → AgentRuntime，网关按租户由闭包装配、图按租户 spec 编译。"""
 
 import httpx2
 import pytest
@@ -16,6 +16,8 @@ from app import deps as deps_mod
 
 if not hasattr(deps_mod, "build_runtime"):
     pytest.skip("M2.3 未敲：deps.py 尚无 build_runtime", allow_module_level=True)
+if "approvals" not in deps_mod.RuntimeParts.__dataclass_fields__:
+    pytest.skip("M2.7 未敲：RuntimeParts 尚无 approvals", allow_module_level=True)
 
 from app.core.config import Settings
 from app.deps import (
@@ -24,6 +26,7 @@ from app.deps import (
     build_runtime,
     build_runtime_parts,
 )
+from app.domain.approvals import ApprovalStore
 from app.domain.events import EventStore
 from app.domain.sessions import SessionStateStore
 from app.engine.runtime.runtime import AgentRuntime
@@ -42,6 +45,7 @@ def test_build_runtime_parts_wraps_stores(db_session_factory):
     assert isinstance(parts, RuntimeParts)
     assert isinstance(parts.events, EventStore)
     assert isinstance(parts.sessions, SessionStateStore)
+    assert isinstance(parts.approvals, ApprovalStore)
 
 
 def test_build_runtime_compiles_tenant_bound_graph(http_client):
@@ -54,10 +58,12 @@ def test_build_runtime_compiles_tenant_bound_graph(http_client):
     runtime_parts = RuntimeParts(
         events=EventStore(None),  # type: ignore[arg-type]
         sessions=SessionStateStore(None),  # type: ignore[arg-type]
+        approvals=ApprovalStore(None),  # type: ignore[arg-type]
         checkpointer=InMemorySaver(),
     )
     runtime = build_runtime(gateway_parts, runtime_parts)
     assert isinstance(runtime, AgentRuntime)
+    assert runtime._approvals is runtime_parts.approvals  # type: ignore[attr-defined]
     agent = runtime.build_agent("tA", AgentSpec(system_prompt="演示"))
     assert "model" in agent.get_graph().nodes
     with pytest.raises(ValueError):

@@ -147,7 +147,9 @@ async def test_tool_exception_becomes_tool_error_and_loop_continues():
     )
     tool_msg = next(m for m in snap.values["messages"] if isinstance(m, ToolMessage))
     assert tool_msg.status == "error"
-    assert tool_msg.content.startswith(u.TOOL_FAILED.format(detail="")[:6])
+    assert (
+        u.TOOL_FAILED.format(detail="")[:6] in tool_msg.content
+    )  # M2.8 起回填经不可信包裹
     assert "sk-***" in tool_msg.content
     assert got[-1].payload["reason"] == "completed"
 
@@ -175,7 +177,7 @@ async def test_invalid_args_do_not_reach_write_ahead():
         {"configurable": {"thread_id": sid}}
     )
     tool_msg = next(m for m in snap.values["messages"] if isinstance(m, ToolMessage))
-    assert tool_msg.status == "error" and tool_msg.content.startswith("参数校验失败：")
+    assert tool_msg.status == "error" and "参数校验失败：" in tool_msg.content
 
 
 async def test_tool_context_carries_identity_not_model_input():
