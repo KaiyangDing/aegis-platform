@@ -6,11 +6,15 @@
 T1 idle→running（CAS 失败 = 会话正忙）→ agent.astream(..., durability="sync", recursion_limit=推导, stream_mode=["custom"])
 → 钩子内落盘的事件经 stream_writer 到达这里逐条 yield。
 图缓存：编译成本按租户 spec 摊销；指纹覆盖注入面全部会影响图形态的字段（工具 schema 含在内），改 spec 即换图。
-resume（ADR-013 决策 3 / 6）：审批续跑与崩溃恢复同一入口 = 从最后一个 checkpoint 之后重放；approval_id 非 None = 计划内审批续跑，
+resume（ADR-013 决策 3 / 6；契约 C12）：审批续跑与崩溃恢复同一入口 = 从最后一个 checkpoint 之后重放；approval_id 非 None = 计划内审批续跑，
 None = 崩溃恢复（前作 resume(spec, session_id, approval_id=None) 同一分野；M2 无会话锁，"运行中的会话是不是死了"只能由调用方断言）。
-M2.7 接审批续跑：会话必须在 awaiting_approval → 取挂起点（缺失即先重放到挂起点）→ approval_id 属于挂起载荷 → 载荷里的审批单全部终态才放行
+审批续跑：会话必须在 awaiting_approval → 取挂起点（缺失即先重放到挂起点）→ approval_id 属于挂起载荷 → 载荷里的审批单全部终态才放行
 （仍 pending → ValueError）→ T3 awaiting→running（CAS 输家 = 并发恢复 → SessionBusy）→ Command(resume={"decisions": […]}) 从挂起节点重放；
-决定数恒等于挂起数、决定由审批表终态翻译而来——这就是 API 层形态守卫的落点。崩溃恢复分诊随 M2.9 补进同一入口。
+决定数恒等于挂起数、决定由审批表终态翻译而来——这就是 API 层形态守卫的落点。
+崩溃恢复：前作四支分诊在 v2 坍缩为"重放 + 去重"——idle / failed 没有可恢复的 run；挂起点在且审批单仍 pending = 健康的挂起（不计次、零事件）；
+recovery_count +1，超上限 → T5 →failed + recovery_abandoned（图外事件）；挂起点在且单已终态 → 与审批续跑同路径；next 为空 → 图已收尾只是
+T4 没翻，只修状态；其余 → astream(None) 重放：tools 节点 ToolExec 去重（原键 reexecute）、model 节点 ModelCall 对半截 llm_call 补
+llm_result(interrupted, cause=replay) 再作废重发、after_agent 末事件去重 + T4。
 """
 
 import hashlib
@@ -28,7 +32,9 @@ from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
 
-from app.engine.runtime.events import AgentEvent, EventType
+from app.core.logs import get_logger
+from app.engine.runtime import utterances as u
+from app.engine.runtime.events import AgentEvent, EventType, event_id
 from app.engine.runtime.middleware.approvals import Approvals
 from app.engine.runtime.middleware.gates import Gates
 from app.engine.runtime.middleware.guards import Guards
@@ -37,6 +43,7 @@ from app.engine.runtime.middleware.run_events import RunEvents
 from app.engine.runtime.middleware.summarization import AegisSummarization
 from app.engine.runtime.middleware.tool_exec import ToolExec
 from app.engine.runtime.protocols import (
+    RECOVERY_LIMIT,
     ApprovalStatus,
     ApprovalStoreLike,
     CancelSignal,
@@ -47,6 +54,8 @@ from app.engine.runtime.protocols import (
 from app.engine.runtime.spec import AgentSpec, LoopPolicy
 from app.engine.runtime.state import RunContext
 from app.engine.runtime.tools import PrecheckHook, ToolRegistry, to_structured_tools
+
+logger = get_logger(__name__)
 
 MIDDLEWARE_STACK: tuple[type[AgentMiddleware], ...] = (
     RunEvents,
@@ -158,7 +167,8 @@ def spec_fingerprint(spec: AgentSpec) -> str:
 class AgentRuntime:
     """对外门面：一次 run = 一条事件流；图按 (tenant_id, spec 指纹) LRU 缓存；网关按租户装配（组合根注入闭包）。
 
-    approvals=None 是无审批的单元测试形态（风险闸门命中即 RuntimeError）；precheck=None = 批准后前置校验全通过（M3 注入真实校验）。
+    approvals=None 是无审批的单元测试形态（风险闸门命中即 RuntimeError）；precheck=None = 批准后前置校验全通过（M3 注入真实校验）；
+    recovery_limit = 同一会话连续崩溃恢复次数上限（超过即 failed + recovery_abandoned）。
     """
 
     def __init__(
@@ -170,6 +180,7 @@ class AgentRuntime:
         checkpointer: BaseCheckpointSaver,
         approvals: ApprovalStoreLike | None = None,
         precheck: PrecheckHook | None = None,
+        recovery_limit: int = RECOVERY_LIMIT,
         cache_size: int = 64,
     ) -> None:
         self._gateway_for = gateway_for
@@ -178,6 +189,7 @@ class AgentRuntime:
         self._checkpointer = checkpointer
         self._approvals = approvals
         self._precheck = precheck
+        self._recovery_limit = recovery_limit
         self._cache_size = cache_size
         self._agents: OrderedDict[tuple[str, str], Any] = OrderedDict()
 
@@ -303,13 +315,13 @@ class AgentRuntime:
         ):
             yield event
 
-    async def _decisions(self, interrupts: Sequence[Any]) -> list[dict[str, Any]]:
-        """审批表终态 → 决定列表（借 HITL 决定形态）。决定数恒等于挂起数；单不存在或仍 pending → ValueError（先 decide / cancel / expire_due）。"""
+    async def _tickets(self, interrupts: Sequence[Any]) -> list[dict[str, Any]]:
+        """挂起载荷里的审批单现状（顺序 = 载荷顺序）；单不存在 → ValueError（挂起载荷与审批表不一致）。"""
         if self._approvals is None:
             raise RuntimeError(
                 "恢复审批需要审批单存取件（AgentRuntime(approvals=...)）"
             )
-        decisions: list[dict[str, Any]] = []
+        tickets: list[dict[str, Any]] = []
         for pending in interrupts:
             for request in pending.value.get("action_requests", ()):
                 ticket = await self._approvals.get(request["approval_id"])
@@ -317,20 +329,22 @@ class AgentRuntime:
                     raise ValueError(
                         f"审批单 {request['approval_id']} 不存在——挂起载荷与审批表不一致"
                     )
-                if ticket["status"] == ApprovalStatus.PENDING:
-                    raise ValueError(
-                        f"审批单 {ticket['id']} 仍是 pending——先 decide / cancel / expire_due 再 resume"
-                    )
-                decisions.append(
-                    {
-                        "type": "approve"
-                        if ticket["status"] == ApprovalStatus.APPROVED
-                        else "reject",
-                        "approval_id": ticket["id"],
-                        "status": ticket["status"],
-                    }
-                )
-        return decisions
+                tickets.append(ticket)
+        return tickets
+
+    @staticmethod
+    def _decisions(tickets: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        """审批表终态 → 决定列表（借 HITL 决定形态：approve / reject）；决定数恒等于挂起数。调用方已保证全部终态。"""
+        return [
+            {
+                "type": "approve"
+                if ticket["status"] == ApprovalStatus.APPROVED
+                else "reject",
+                "approval_id": ticket["id"],
+                "status": ticket["status"],
+            }
+            for ticket in tickets
+        ]
 
     @staticmethod
     async def _pending_interrupts(agent: Any, config: dict[str, Any]) -> list[Any]:
@@ -347,23 +361,33 @@ class AgentRuntime:
         approval_id: str | None = None,
         cancel: CancelSignal | None = None,
     ) -> AsyncIterator[AgentEvent]:
-        """恢复单入口（审批续跑 / 崩溃恢复同路径）。approval_id 是调用方意图（前作同一分野）：非 None = 计划内审批续跑
-        （坐席刚对这张单落下决定）；None = 崩溃恢复（调用方断言上一进程已死；分诊随 M2.9）。
+        """恢复单入口（审批续跑 / 崩溃恢复同路径，见模块 docstring）。approval_id 非 None = 计划内审批续跑；None = 崩溃恢复。
 
-        审批续跑：会话必须在 awaiting_approval（否则 SessionBusy：并发恢复已有赢家或会话在跑）；挂起点缺失 = T2 之后、挂起
-        checkpoint 之前崩过 → 先以 None 重放到挂起点（Approvals 每步幂等：单命中、事件去重、T2 跳过），再取挂起点；approval_id
-        必须属于挂起载荷（否则 ValueError）；载荷里的审批单全部终态才放行（仍 pending → ValueError：先 decide / cancel / expire_due）
-        → T3 CAS awaiting→running（输家 SessionBusy）→ Command(resume={"decisions": […]}) 从挂起节点重放。
         产出 = 恢复段新落盘的事件（重放去重命中的旧事件不再外流）。
         """
         row = await self._owned_session(tenant_id, session_id)
-        if approval_id is None:
-            raise NotImplementedError("崩溃恢复分诊随 M2.9 实装（M2.7 只接审批续跑）")
+        source = (
+            self._resume_approval(row, spec, approval_id, cancel)
+            if approval_id is not None
+            else self._recover(row, spec, cancel)
+        )
+        async for event in source:
+            yield event
+
+    async def _resume_approval(
+        self,
+        row: dict[str, Any],
+        spec: AgentSpec,
+        approval_id: str,
+        cancel: CancelSignal | None,
+    ) -> AsyncIterator[AgentEvent]:
+        """计划内审批续跑：awaiting_approval → 挂起点（缺失即先重放到挂起点）→ 单号属于挂起点 → 单全部终态 → T3 → Command(resume)。"""
+        session_id = row["id"]
         if row["run_state"] != SessionRunState.AWAITING_APPROVAL.value:
             raise SessionBusy(
                 f"会话 {session_id} 不在 awaiting_approval（当前 {row['run_state']}）：并发恢复已有赢家或会话在跑"
             )
-        agent = self.build_agent(tenant_id, spec)
+        agent = self.build_agent(row["tenant_id"], spec)
         config = self._config(session_id, spec)
         ctx = self._context(row, spec, cancel=cancel, token_seed=0)
         interrupts = await self._pending_interrupts(agent, config)
@@ -375,14 +399,14 @@ class AgentRuntime:
                 raise RuntimeError(
                     f"会话 {session_id} 在 awaiting_approval 但重放后仍无挂起点——事实源不一致"
                 )
-        requested = {
-            request["approval_id"]
-            for pending in interrupts
-            for request in pending.value.get("action_requests", ())
-        }
-        if approval_id not in requested:
+        tickets = await self._tickets(interrupts)
+        if approval_id not in {ticket["id"] for ticket in tickets}:
             raise ValueError(f"审批单 {approval_id} 不属于会话 {session_id} 的挂起点")
-        decisions = await self._decisions(interrupts)
+        pending = [t["id"] for t in tickets if t["status"] == ApprovalStatus.PENDING]
+        if pending:
+            raise ValueError(
+                f"审批单 {pending[0]} 仍是 pending——先 decide / cancel / expire_due 再 resume"
+            )
         if not await self._sessions.transition(
             session_id,
             expected=SessionRunState.AWAITING_APPROVAL.value,
@@ -390,6 +414,100 @@ class AgentRuntime:
         ):
             raise SessionBusy(f"会话 {session_id} 的恢复已有并发赢家")
         async for event in self._drive(
-            agent, Command(resume={"decisions": decisions}), config, ctx
+            agent, Command(resume={"decisions": self._decisions(tickets)}), config, ctx
         ):
             yield event
+
+    async def _recover(
+        self, row: dict[str, Any], spec: AgentSpec, cancel: CancelSignal | None
+    ) -> AsyncIterator[AgentEvent]:
+        """崩溃恢复分诊（调用方断言上一进程已死）：健康挂起 → 零事件不计次；计次超上限 → 放弃；决定已落 → 同审批续跑；
+        图已收尾 → 只修状态；其余 → 从最后一个 checkpoint 之后重放（去重 / 作废重发 / 末事件去重）。"""
+        session_id, state = row["id"], row["run_state"]
+        if state in (SessionRunState.IDLE.value, SessionRunState.FAILED.value):
+            raise ValueError(f"会话 {session_id} 处于 {state}：没有可恢复的 run")
+        agent = self.build_agent(row["tenant_id"], spec)
+        config = self._config(session_id, spec)
+        ctx = self._context(row, spec, cancel=cancel, token_seed=0)
+        snapshot = await agent.aget_state(config)
+        interrupts = [i for task in snapshot.tasks for i in task.interrupts]
+        tickets = await self._tickets(interrupts) if interrupts else []
+        if any(t["status"] == ApprovalStatus.PENDING for t in tickets):
+            # 健康的挂起（等坐席），不是崩溃：不计恢复次数、零事件；run_state 停在 running = T2 之后被旁路，修回 awaiting
+            if (
+                state == SessionRunState.RUNNING.value
+                and not await self._sessions.transition(
+                    session_id,
+                    expected=SessionRunState.RUNNING.value,
+                    to=SessionRunState.AWAITING_APPROVAL.value,
+                )
+            ):
+                logger.warning(u.LOG_RECOVERY_FLIP_FAILED, session_id=session_id)
+            return
+        count = await self._sessions.bump_recovery(session_id)
+        if count is not None and count > self._recovery_limit:
+            async for event in self._abandon(row, count):
+                yield event
+            return
+        if tickets:
+            # 决定已落、续跑没来得及（或续跑中途崩）：与计划内续跑同一条路径
+            if (
+                state == SessionRunState.AWAITING_APPROVAL.value
+                and not await self._sessions.transition(
+                    session_id,
+                    expected=SessionRunState.AWAITING_APPROVAL.value,
+                    to=SessionRunState.RUNNING.value,
+                )
+            ):
+                raise SessionBusy(f"会话 {session_id} 的恢复已有并发赢家")
+            payload: Any = Command(resume={"decisions": self._decisions(tickets)})
+        elif not snapshot.next:
+            # 图已收尾（末事件已在事实源）只是 T4 没翻：只修状态、零事件（框架无节点可重放）
+            logger.info(u.LOG_RECOVERY_STATE_REPAIRED, session_id=session_id)
+            if not await self._sessions.transition(
+                session_id, expected=state, to=SessionRunState.IDLE.value
+            ):
+                logger.warning(u.LOG_RECOVERY_FLIP_FAILED, session_id=session_id)
+            await self._sessions.reset_recovery(session_id)
+            return
+        else:
+            payload = None  # 从最后一个 checkpoint 之后重放：ToolExec 去重 / ModelCall 作废重发 / after_agent 末事件去重
+        async for event in self._drive(agent, payload, config, ctx):
+            yield event
+
+    async def _abandon(
+        self, row: dict[str, Any], count: int
+    ) -> AsyncIterator[AgentEvent]:
+        """恢复次数超上限：T5 →failed（毒会话交人工）+ recovery_abandoned 图外事件（无框架任务身份：以本次恢复的 run_id 顶替派生输入，每次放弃各一条）。"""
+        session_id = row["id"]
+        logger.warning(
+            u.LOG_RECOVERY_ABANDONED, session_id=session_id, recovery_count=count
+        )
+        if not await self._sessions.transition(
+            session_id, expected=row["run_state"], to=SessionRunState.FAILED.value
+        ):
+            logger.warning(u.LOG_RECOVERY_FLIP_FAILED, session_id=session_id)
+        run_id = uuid.uuid4().hex
+        eid = event_id(session_id, run_id, "recovery_abandoned", 0)
+        payload = {
+            "recovery_count": count,
+            "limit": self._recovery_limit,
+            "run_state": row["run_state"],
+        }
+        seq, _ = await self._events.append(
+            event_id=eid,
+            tenant_id=row["tenant_id"],
+            session_id=session_id,
+            run_id=run_id,
+            event_type=EventType.RECOVERY_ABANDONED.value,
+            payload=payload,
+        )
+        yield AgentEvent(
+            id=eid,
+            tenant_id=row["tenant_id"],
+            session_id=session_id,
+            run_id=run_id,
+            seq=seq,
+            type=EventType.RECOVERY_ABANDONED,
+            payload=payload,
+        )

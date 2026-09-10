@@ -111,6 +111,9 @@ APPROVAL_LABEL_EXPIRED = "已超时"
 DISCARDED_NOTE = "该调用在等待人工审批期间未执行；如仍需要请重新发起。"
 PRECHECK_VETO_TEMPLATE = "审批已通过但前置校验未过：{reason}，操作未执行。"
 
+# --- 崩溃恢复（M2.9；进 llm_result 事件的 detail） ---
+LLM_REPLAY_DETAIL = "进程在该次调用完成前死亡，作废重发（重放）"
+
 # --- 告警文案（logger.warning 的 event；M2.3 起） ---
 LOG_RUN_STATE_FLIP_FAILED = (
     "终止时 run_state 翻转失败（会话所有权可能已旁落，状态机被旁路）"
@@ -120,5 +123,9 @@ LOG_TOOL_DIGEST_FALLBACK = "工具结果摘要失败，走硬截断（增强层 
 LOG_SUMMARY_FALLBACK = "滚动摘要失败，走提取式降级（增强层 fail-open）"
 LOG_HISTORY_CLEARED = "user_input 估算超出 history_budget，历史层清空、原文照放"
 LOG_RISK_POLICY_CRASHED = "风险闸门谓词崩溃：该调用 fail-closed 阻断，不进审批"
+LOG_LLM_REPLAY = "重放命中既有 llm_call：半截 LLM 调用作废重发"
+LOG_RECOVERY_STATE_REPAIRED = "崩溃恢复：图已收尾只是 run_state 没翻，仅修状态"
+LOG_RECOVERY_ABANDONED = "崩溃恢复次数超上限：会话置 failed（毒会话交人工）"
+LOG_RECOVERY_FLIP_FAILED = "崩溃恢复：run_state 翻转失败（状态机被旁路）"
 LOG_APPROVAL_FLIP_FAILED = "挂起时 running→awaiting_approval 翻转失败且会话不在 awaiting_approval（状态机被旁路）"
 LOG_TOOL_FOLD_OVER_BUDGET = "工具结果层全部折叠后仍超预算，照放并由余量消化"

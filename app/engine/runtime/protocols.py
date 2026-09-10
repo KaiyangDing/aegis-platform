@@ -68,6 +68,11 @@ class SessionRunState(StrEnum):
     FAILED = "failed"
 
 
+RECOVERY_LIMIT = 3
+"""同一会话连续崩溃恢复次数上限（前作 C9；domain 侧 sessions.RECOVERY_LIMIT 同值，测试互钉）：
+超过即 T5 →failed + recovery_abandoned 事件（毒会话不再自动恢复，留给人工）。正常终止清零——上限管的是"连续"。"""
+
+
 @runtime_checkable
 class SessionStateLike(Protocol):
     """会话行的原语：读身份 / CAS 翻转（返回是否翻成）/ 恢复计数。建行不在协议里（API 与测试的事）。"""

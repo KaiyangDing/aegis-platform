@@ -12,6 +12,8 @@ handler → 四组 except → llm_result }。流级中断作废重发（消耗�
 （逐字符 ≡ 整段的不变量让 M3 真流式共享同一行为）+ final_check 兜底；命中 → guardrail_triggered(stream|final) 事件 + 替换后的
 AIMessage 进 state（流中命中 = 已放行前缀 + SAFE_REPLY，终局命中 = 整条 SAFE_REPLY；工具轮只留放行前缀不补话术）并打
 GUARDRAIL_TRUNCATED 标记，checkpoint 不留泄漏原文。入口打标（entry_notice 通道）随编译进 system 层。
+半截 LLM（M2.9，契约 C12）：重放命中既有 llm_call（进程死在该次调用完成之前）→ 补配对 llm_result(interrupted, cause=replay)
+后以下一序号重发，重发消耗迭代；显式接受重生成文本不同（保事实不保字节）。
 """
 
 import time
@@ -28,6 +30,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.types import Command
 
+from app.core.logs import get_logger
 from app.core.tokens import estimate_messages_tokens, estimate_tokens, message_text
 from app.engine.gateway.errors import (
     BudgetExceeded,
@@ -50,6 +53,7 @@ from app.engine.runtime.state import (
     terminated,
 )
 
+logger = get_logger(__name__)
 _monotonic = time.monotonic  # 测试接缝
 
 Handler = Callable[[ModelRequest[RunContext]], Awaitable[ModelResponse]]
@@ -119,7 +123,7 @@ class ModelCall(AgentMiddleware[RunState, RunContext]):
                     tokens_used=tokens_used,
                 )
             iteration += 1
-            await emit(
+            _, created = await emit(
                 runtime,
                 EventType.LLM_CALL,
                 {
@@ -130,6 +134,24 @@ class ModelCall(AgentMiddleware[RunState, RunContext]):
                 hook="llm_call",
                 ordinal=attempt,
             )
+            if not created:
+                # 重放命中既有 llm_call = 上一进程死在这次调用完成之前（有 llm_call 无 llm_result；若旧结果其实已落盘，
+                # 这条 interrupted 会被同 id 去重吸收）：作废重发——配对 llm_result(interrupted, cause=replay)，下一序号重发，消耗迭代
+                logger.info(u.LOG_LLM_REPLAY, iteration=iteration)
+                await emit(
+                    runtime,
+                    EventType.LLM_RESULT,
+                    {
+                        "iteration": iteration,
+                        "status": "interrupted",
+                        "cause": "replay",
+                        "detail": u.LLM_REPLAY_DETAIL,
+                    },
+                    hook="llm_result",
+                    ordinal=attempt,
+                )
+                attempt += 1
+                continue
             started = _monotonic()
             try:
                 response = await handler(request)
