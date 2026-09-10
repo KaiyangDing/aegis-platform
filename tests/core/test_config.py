@@ -32,7 +32,9 @@ def test_fault_injection_is_forbidden_in_prod():
 
 
 def test_fault_injection_zero_in_prod_and_positive_in_dev_are_fine():
-    assert Settings(_env_file=None, app_env="prod").fault_injection_rate == 0.0
+    # 生产环境自 S2 起必须带 JWT 密钥（tests/core/test_config_auth.py 钉这条），这里只看注入率
+    prod = Settings(_env_file=None, app_env="prod", jwt_secret="x" * 32)
+    assert prod.fault_injection_rate == 0.0
     assert (
         Settings(_env_file=None, fault_injection_rate=0.5).fault_injection_rate == 0.5
     )

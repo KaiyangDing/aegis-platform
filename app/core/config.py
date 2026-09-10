@@ -1,7 +1,7 @@
 """全局配置：唯一的 .env 消费方。字段名即环境变量名（大小写不敏感）。
 
 密钥只从环境变量读，类型用 SecretStr：repr/日志自动打码，取真值必须显式 .get_secret_value()
-（全仓只允许候选工厂一处取）。只存原始类型：档位/候选/异常类型全在 engine，core 不认识它们。
+（上游密钥只许候选工厂一处取；JWT 密钥只许 core/auth 的验签依赖与签发脚本取）。只存原始类型：档位/候选/异常类型全在 engine，core 不认识它们。
 """
 
 from functools import lru_cache
@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     redis_url: str = (
         "redis://127.0.0.1:6379/0"  # 空串 = 无 Redis（熔断退化进程内、缓存关闭）
     )
+
+    # --- 身份与角色（S2；ADR-014）：HS256 短期 JWT，密钥只从环境变量读。空默认让测试零密钥即可跑；
+    # 生产环境空密钥启动即炸（下方校验器），签发 / 验签路径再各自对空钥弱钥 fail-loud（core/auth.py）。
+    jwt_secret: SecretStr = SecretStr("")
+    jwt_user_ttl_s: int = Field(default=7200, gt=0)  # 终端用户票 2h
+    jwt_staff_ttl_s: int = Field(default=28800, gt=0)  # 坐席 / 管理员票 8h
 
     # --- 上游供应商与档位路由（M1.2） ---
     dashscope_api_key: SecretStr = SecretStr("")
@@ -102,6 +108,13 @@ class Settings(BaseSettings):
         # 注入器是演示/实验专用：生产环境配置了注入率，进程启动即炸，不许带病上线
         if self.app_env == "prod" and self.fault_injection_rate > 0:
             raise ValueError("生产环境禁止故障注入：FAULT_INJECTION_RATE 必须为 0")
+        return self
+
+    @model_validator(mode="after")
+    def _prod_requires_jwt_secret(self) -> Settings:
+        # 空密钥在 dev 只是"还没配"，在 prod 是带病上线：签发 / 验签会在首个请求才炸，这里提前到启动
+        if self.app_env == "prod" and not self.jwt_secret.get_secret_value():
+            raise ValueError("生产环境必须配置 JWT_SECRET（≥32 字节）——空密钥不许上线")
         return self
 
     @model_validator(mode="after")

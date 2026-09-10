@@ -75,3 +75,9 @@ type = "forbidden"
 source_modules = ["app.engine.gateway"]
 forbidden_modules = ["app.engine.runtime"]
 
+[[tool.importlinter.contracts]]
+name = "business 只被入口引用"
+type = "forbidden"
+source_modules = ["app.core", "app.engine", "app.domain"]
+forbidden_modules = ["app.business"]
+
