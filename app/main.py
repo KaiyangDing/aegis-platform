@@ -2,9 +2,8 @@
 LangGraph checkpointer / AgentRuntime），关停时逐个收尾。
 
 这些对象都绑定创建时的事件循环（asyncpg 连接、httpx2 连接池、psycopg 连接池），所以在 lifespan 里建而不在模块级建；
-worker 进程（app/worker.py，M3）在自己的 loop 里用同一批 build_* 再建一份。
-入站限流器只在这里建（InboundLimiter，共用同一个 Redis 客户端）并挂到 app.state；无 Redis 配置则挂 None = 永远 fail-open；
-端点挂载随 M3。
+本仓只有 API 一种进程形态（无 worker：周期任务都改成了幂等的按需入口，ADR-014）。
+入站限流器只在这里建（InboundLimiter，共用同一个 Redis 客户端）并挂到 app.state；无 Redis 配置则挂 None = 永远 fail-open。
 checkpointer（ADR-011）：psycopg 连接池 + 框架自带迁移，挂 app.state.checkpointer；Windows 开发进程须以
 `--loop app.core.loops:selector_loop_factory` 启动，否则 open_checkpointer 在启动期就报明白话。
 AgentRuntime（M2.3）：进程级单件，挂 app.state.runtime；图按租户 spec 在它里面缓存。
