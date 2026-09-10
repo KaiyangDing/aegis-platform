@@ -24,3 +24,13 @@ REFUND_NOT_POSITIVE = "退款金额必须大于 0"
 REFUND_ALREADY = "该订单已退款，不能重复退款"
 REFUND_OVER_PAID = "退款金额超过订单实付金额"
 """业务拒绝三条：以 {"error": …} 回填模型（不是异常，不进连败账、不禁用工具）。"""
+
+# --- HTTP 层（routers 消费的 detail 文本；状态码分工见 routers/common.py） ---
+TENANT_NOT_ENABLED = "该租户未开通服务"
+SESSION_NOT_FOUND = "会话不存在"
+SESSION_BUSY = "会话正忙：上一次处理尚未结束"
+SESSION_AWAITING_APPROVAL = "会话正等待人工审批，请在审批完成后再发送消息"
+APPROVAL_NOT_FOUND = "审批单不存在"
+APPROVAL_FOREIGN_TENANT = "无权处理其他租户的审批单"
+APPROVAL_NOT_PENDING = "审批单已非待审状态（已决定、已撤回或已过期）"
+RUN_FAILED = "本次处理中断，请稍后重试或联系人工客服"

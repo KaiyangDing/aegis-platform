@@ -29,7 +29,12 @@ from app.engine.gateway.cache import CacheStore, TenantCache
 from app.engine.gateway.candidates import build_candidates
 from app.engine.gateway.faults import inject_faults
 from app.engine.gateway.outbound import ProviderLimiter
-from app.engine.gateway.protocols import BreakerLike, LimiterLike, MeterLike
+from app.engine.gateway.protocols import (
+    BreakerLike,
+    BudgetResolver,
+    LimiterLike,
+    MeterLike,
+)
 from app.engine.gateway.resilience import RetryPolicy
 from app.engine.gateway.router import AegisGateway
 from app.engine.gateway.routing import Candidate, parse_routes, unique_candidates
@@ -130,8 +135,14 @@ def build_gateway_parts(
     )
 
 
-def gateway_for(parts: GatewayParts, tenant_id: str) -> AegisGateway:
-    """按租户装配一个网关实例（每请求一个，构造开销只是 pydantic 校验）。"""
+def gateway_for(
+    parts: GatewayParts,
+    tenant_id: str,
+    *,
+    budget_resolver: BudgetResolver | None = None,
+) -> AegisGateway:
+    """按租户装配一个网关实例（每请求一个，构造开销只是 pydantic 校验）。
+    budget_resolver 是月度预算事实源（L3 租户配置注入，M3.2）；None = 用静态配置 tenant_monthly_token_budget。"""
     tenant_id = validate_tenant_id(tenant_id)  # 入口守卫：非法身份不许碰任何共享件
     settings = parts.settings
     return AegisGateway(
@@ -147,7 +158,7 @@ def gateway_for(parts: GatewayParts, tenant_id: str) -> AegisGateway:
             else None
         ),
         meter=parts.meter,
-        budget_resolver=None,  # M3 租户目录接 tenants 表；M1 静态配置兜底
+        budget_resolver=budget_resolver,
         monthly_token_budget=settings.tenant_monthly_token_budget,
         request_token_budget=settings.request_token_budget,
         retry_policy=parts.retry_policy,
@@ -168,11 +179,17 @@ def build_runtime_parts(
 
 
 def build_runtime(
-    gateway_parts: GatewayParts, runtime_parts: RuntimeParts
+    gateway_parts: GatewayParts,
+    runtime_parts: RuntimeParts,
+    *,
+    budget_resolver: BudgetResolver | None = None,
 ) -> AgentRuntime:
-    """进程级 AgentRuntime：网关按租户由闭包装配（每 run 一个租户绑定的网关实例进图）。批准后前置校验 M3 注入（此处缺席 = 全通过）。"""
+    """进程级 AgentRuntime：网关按租户由闭包装配（每 run 一个租户绑定的网关实例进图，月度预算 resolver 随之注入）。
+    批准后前置校验缺席 = 全通过（命运表 B4）。"""
     return AgentRuntime(
-        gateway_for=lambda tenant_id: gateway_for(gateway_parts, tenant_id),
+        gateway_for=lambda tenant_id: gateway_for(
+            gateway_parts, tenant_id, budget_resolver=budget_resolver
+        ),
         events=runtime_parts.events,
         sessions=runtime_parts.sessions,
         checkpointer=runtime_parts.checkpointer,
