@@ -4,6 +4,7 @@ before_agent（列表序最先）：user_message 首事件 + run 级通道归零
 after_agent（列表序反转后最后）：assistant_message（终答或兜底话术）+ loop_terminated 末事件（八值 reason、iteration、detail、
 cause?），然后 T4 running→idle（CAS 失败只告警：状态机被旁路是响亮留痕不掀收尾的事）+ 恢复计数清零。
 终止事实只从 termination 通道读：谁终止谁写通道并追加兜底 AIMessage，这里不选话术、不加消息。
+出口守卫替换过的终答（M2.8：AIMessage 带 GUARDRAIL_TRUNCATED 标记）在 assistant_message 事件里标 guardrail_truncated=True。
 """
 
 from typing import Any
@@ -18,7 +19,13 @@ from app.engine.runtime import utterances as u
 from app.engine.runtime.events import EventType
 from app.engine.runtime.protocols import SessionRunState
 from app.engine.runtime.spec import TerminationReason
-from app.engine.runtime.state import RunContext, RunState, emit, run_channels_reset
+from app.engine.runtime.state import (
+    GUARDRAIL_TRUNCATED,
+    RunContext,
+    RunState,
+    emit,
+    run_channels_reset,
+)
 
 logger = get_logger(__name__)
 
@@ -49,14 +56,18 @@ class RunEvents(AgentMiddleware[RunState, RunContext]):
                 if isinstance(last, AIMessage)
                 else None
             )
+            reply: dict[str, Any] = {
+                "content": message_text(last),
+                "token_usage": usage["output_tokens"] if usage else None,
+            }
+            if isinstance(last, AIMessage) and last.additional_kwargs.get(
+                GUARDRAIL_TRUNCATED
+            ):
+                reply["guardrail_truncated"] = (
+                    True  # 出口守卫替换过：事件面标明这不是模型原话
+                )
             await emit(
-                runtime,
-                EventType.ASSISTANT_MESSAGE,
-                {
-                    "content": message_text(last),
-                    "token_usage": usage["output_tokens"] if usage else None,
-                },
-                hook="assistant_message",
+                runtime, EventType.ASSISTANT_MESSAGE, reply, hook="assistant_message"
             )
             payload: dict[str, Any] = {
                 "reason": TerminationReason.COMPLETED.value,

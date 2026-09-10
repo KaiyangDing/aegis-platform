@@ -8,7 +8,10 @@ handler → 四组 except → llm_result }。流级中断作废重发（消耗�
 终止 = 返回 ExtendedModelResponse：结果里放兜底 AIMessage（零话术时放空 AIMessage——保证"最后一条 AIMessage 无 tool_calls"
 让模型→工具边走向 end，探针⑹ + factory 边规则），command 写 termination / iteration / tokens_used（同 superstep 对 after_model 可见）。
 绝不 except GatewayError 基类：ProviderError 泄漏与事实源异常裸炸。
-M2.8 接出口守卫终检（AIMessage 进 state 之前替换）。
+出口守卫终检（M2.8 挂点③，ADR-012 判据④）：llm_result 写原文之后、AIMessage 进 state 之前——OutputGuard 整段 feed + flush
+（逐字符 ≡ 整段的不变量让 M3 真流式共享同一行为）+ final_check 兜底；命中 → guardrail_triggered(stream|final) 事件 + 替换后的
+AIMessage 进 state（流中命中 = 已放行前缀 + SAFE_REPLY，终局命中 = 整条 SAFE_REPLY；工具轮只留放行前缀不补话术）并打
+GUARDRAIL_TRUNCATED 标记，checkpoint 不留泄漏原文。入口打标（entry_notice 通道）随编译进 system 层。
 """
 
 import time
@@ -34,10 +37,18 @@ from app.engine.gateway.errors import (
     GatewayStreamInterrupted,
     TenantQuotaExceeded,
 )
+from app.engine.runtime import utterances as u
 from app.engine.runtime.context import compile_prompt
 from app.engine.runtime.events import EventType
+from app.engine.runtime.guards import Guardrails, output_audit_payload
 from app.engine.runtime.spec import TerminationReason
-from app.engine.runtime.state import RunContext, RunState, emit, terminated
+from app.engine.runtime.state import (
+    GUARDRAIL_TRUNCATED,
+    RunContext,
+    RunState,
+    emit,
+    terminated,
+)
 
 _monotonic = time.monotonic  # 测试接缝
 
@@ -54,6 +65,11 @@ def _tool_calls_payload(message: AIMessage) -> list[dict[str, Any]]:
 class ModelCall(AgentMiddleware[RunState, RunContext]):
     state_schema = RunState
 
+    def __init__(self, guards: Guardrails | None = None) -> None:
+        """guards：出口守卫工厂（规则库缺省 v1；每次模型调用按 spec 新建一个 OutputGuard 实例）。"""
+        super().__init__()
+        self._guards = guards or Guardrails()
+
     async def awrap_model_call(
         self, request: ModelRequest[RunContext], handler: Handler
     ) -> ModelResponse | ExtendedModelResponse:
@@ -63,7 +79,9 @@ class ModelCall(AgentMiddleware[RunState, RunContext]):
         iteration = request.state.get("iteration", 0)
         tokens_used = request.state.get("tokens_used", 0)
         # 上下文编译：prompt 是 state 的有损投影（system 超预算在此 fail-loud，ValueError 裸穿）
-        compiled = compile_prompt(request.messages, ctx.spec)
+        compiled = compile_prompt(
+            request.messages, ctx.spec, notice=request.state.get("entry_notice")
+        )
         request = request.override(
             system_message=compiled.system,
             messages=compiled.messages,
@@ -203,6 +221,17 @@ class ModelCall(AgentMiddleware[RunState, RunContext]):
                 hook="llm_result",
                 ordinal=attempt,
             )
+            screened, audit = self._screen(message, ctx)
+            if audit is not None:
+                # 出口守卫命中：审计事件先于替换后的 AIMessage 进 state（checkpoint 不留泄漏原文；llm_result 保留原文供审计）
+                await emit(
+                    runtime,
+                    EventType.GUARDRAIL_TRIGGERED,
+                    audit,
+                    hook="guardrail_output",
+                    ordinal=attempt,
+                )
+                response = ModelResponse(result=[*response.result[:-1], screened])
             return ExtendedModelResponse(
                 model_response=response,
                 command=Command(
@@ -212,6 +241,44 @@ class ModelCall(AgentMiddleware[RunState, RunContext]):
                     }
                 ),
             )
+
+    def _screen(
+        self, message: AIMessage, ctx: RunContext
+    ) -> tuple[AIMessage, dict[str, Any] | None]:
+        """出口终检：无命中原样返回 (message, None)；命中返回 (替换后的 AIMessage, 审计 payload)。
+
+        文本回复：流中命中 = 已放行前缀 + SAFE_REPLY，终局命中 = 整条 SAFE_REPLY；工具轮的前置文本命中只留放行前缀、不补话术
+        （本轮没有对用户的回复位，链路继续走工具）——审计是义务，改写回复不是。
+        """
+        text = message.text
+        if not text:
+            return message, None
+        spec = ctx.spec
+        guard = self._guards.output_guard(
+            system_prompt=spec.system_prompt,  # 片段集用 spec 原文：不可信声明是公开机制说明，模型复述无害不设防
+            tool_names=[t.name for t in spec.tools],
+            owned_values=spec.owned_values,
+        )
+        visible = guard.feed(text) + guard.flush()
+        if guard.hit is not None:
+            audit = output_audit_payload(guard.hit, stage="stream")
+            replaced = visible if message.tool_calls else visible + u.SAFE_REPLY
+        else:
+            hits = guard.final_check(visible)
+            if not hits:
+                return message, None
+            audit = output_audit_payload(hits[0], stage="final")
+            replaced = "" if message.tool_calls else u.SAFE_REPLY
+        screened = message.model_copy(
+            update={
+                "content": replaced,
+                "additional_kwargs": {
+                    **message.additional_kwargs,
+                    GUARDRAIL_TRUNCATED: True,
+                },
+            }
+        )
+        return screened, audit
 
     async def _fail_step(
         self,

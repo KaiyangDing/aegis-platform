@@ -7,7 +7,8 @@
   → ④ write-ahead（tool_call 事件先落盘，事件 id 即幂等键；重放命中既有事件 = reexecute：同一把钥匙、绝不产生第二把；
     持通行证者把事件 id 回填审批单 = 批准已兑现的唯一凭证）
   → ② 身份注入 ToolContext（LLM 不可控）→ ⑤ asyncio.timeout 取更严，读可退避重试、写恒单次、写超时 = RESULT_UNKNOWN 封死重试话术
-  → ⑥ 超预算收缩（fast 档摘要经网关，fail-open 硬截断；产物随事件留痕）→ ⑦ tool_result / tool_error 事件 + 连败两次本轮禁用。
+  → ⑥ 超预算收缩（fast 档摘要经网关，fail-open 硬截断；产物随事件留痕）→ ⑦ tool_result / tool_error 事件 + 连败两次本轮禁用
+  → 回填前包裹为不可信数据（M2.8 挂点②：五结局一律包裹，伪造的边界标记被改写；事件 payload 存原文，包裹只在 prompt 注入面）。
 五结局 ToolOutcome（tools.py）。两种 id 严禁混用：模型侧 tool_call["id"] 只进对话配对与事件 payload 的 model_call_id；
 write-ahead 事件 id 进 ToolContext.tool_call_id 与 tool_result / tool_error 的 tool_call_id。
 每 run 按声明序串行（ToolSerializer；只等会进 tools 的前驱——被 after_model 配对的调用不等）；连败账 / 禁用集 / "本步已写 termination" 住 RunContext.tool_health——
@@ -34,6 +35,7 @@ from app.core.tokens import estimate_tokens
 from app.engine.gateway.errors import sanitize_error_text
 from app.engine.runtime import utterances as u
 from app.engine.runtime.events import EventType
+from app.engine.runtime.guards import wrap_untrusted
 from app.engine.runtime.spec import TerminationReason
 from app.engine.runtime.state import (
     FAIL_STREAK_LIMIT,
@@ -114,7 +116,8 @@ class ToolExec(AgentMiddleware[RunState, RunContext]):
         finally:
             await ctx.tool_order.finish(call["id"])
         return ToolMessage(
-            content=outcome.content,
+            # 挂点②：OK 含真实外部数据必须包；ERROR / RESULT_UNKNOWN 可能转述下游异常文本，同样按不可信处理
+            content=wrap_untrusted(outcome.content, source=f"tool:{call['name']}"),
             tool_call_id=call["id"],
             name=call["name"],
             status="success" if outcome.kind is OutcomeKind.OK else "error",

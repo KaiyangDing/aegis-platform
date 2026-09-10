@@ -1,4 +1,4 @@
-"""L2 运行时：注入面（AgentSpec / ToolDef）、事件事实、话术、跨包协议、图状态、上下文编译与门面。不被 gateway import（import-linter 第四条契约）。"""
+"""L2 运行时：注入面（AgentSpec / ToolDef）、事件事实、话术、跨包协议、图状态、上下文编译、守卫三段与门面。不被 gateway import（import-linter 第四条契约）。"""
 
 from app.engine.runtime.context import CompiledPrompt, compile_prompt
 from app.engine.runtime.events import (
@@ -9,6 +9,13 @@ from app.engine.runtime.events import (
     event_id,
     normalize_event,
     normalize_events,
+)
+from app.engine.runtime.guards import (
+    Guardrails,
+    OutputGuard,
+    Suspicion,
+    build_classifier,
+    wrap_untrusted,
 )
 from app.engine.runtime.protocols import (
     ApprovalStatus,
@@ -69,8 +76,10 @@ __all__ = [
     "EventSource",
     "EventStoreLike",
     "EventType",
+    "Guardrails",
     "LoopPolicy",
     "OutcomeKind",
+    "OutputGuard",
     "PrecheckHook",
     "PrecheckVeto",
     "RiskPolicy",
@@ -81,12 +90,14 @@ __all__ = [
     "SessionStateLike",
     "SideEffect",
     "SubAgentPolicy",
+    "Suspicion",
     "TerminationReason",
     "ToolContext",
     "ToolDef",
     "ToolOutcome",
     "ToolRegistrationError",
     "ToolRegistry",
+    "build_classifier",
     "build_middleware",
     "compile_prompt",
     "event_id",
@@ -96,4 +107,5 @@ __all__ = [
     "spec_fingerprint",
     "to_structured_tools",
     "tool",
+    "wrap_untrusted",
 ]

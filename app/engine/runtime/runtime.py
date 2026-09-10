@@ -1,5 +1,5 @@
 """AgentRuntime 门面（M2.3；M2.4 插入 Gates、接取消信号；M2.5 网关句柄进 RunContext；M2.6 插入 AegisSummarization、栈经 build_middleware
-注入依赖；M2.7 插入 Approvals、resume() 审批续跑单入口、审批单存取件与前置校验挂点进 RunContext）：
+注入依赖；M2.7 插入 Approvals、resume() 审批续跑单入口、审批单存取件与前置校验挂点进 RunContext；M2.8 插入 Guards——七件栈定稿）：
 按 (tenant_id, spec 指纹) 编译并缓存图；run() 单入口驱动一次循环、事件按 seq 序外流。
 
 一次 run（ADR-011 / 012）：读会话行取身份并核对租户归属 → D8 种子（历史 llm_call / llm_result 的估算字段求和）→
@@ -31,6 +31,7 @@ from langgraph.types import Command
 from app.engine.runtime.events import AgentEvent, EventType
 from app.engine.runtime.middleware.approvals import Approvals
 from app.engine.runtime.middleware.gates import Gates
+from app.engine.runtime.middleware.guards import Guards
 from app.engine.runtime.middleware.model_call import ModelCall
 from app.engine.runtime.middleware.run_events import RunEvents
 from app.engine.runtime.middleware.summarization import AegisSummarization
@@ -49,14 +50,16 @@ from app.engine.runtime.tools import PrecheckHook, ToolRegistry, to_structured_t
 
 MIDDLEWARE_STACK: tuple[type[AgentMiddleware], ...] = (
     RunEvents,
+    Guards,
     AegisSummarization,
     Approvals,
     Gates,
     ModelCall,
     ToolExec,
 )
-"""栈序即语义（ADR-012 决策 1）。M2.7 形态：before_model 按列表序 = 压缩 → 闸门；after_model 反序 = 闸门（#5 / #4）先于审批，
-闸门终止的 jump end 绕过审批；Approvals 是列表首个 after_model = 循环出口节点。Guards 随 M2.8 插到 RunEvents 之后。
+"""栈序即语义（ADR-012 决策 1），七件定稿：before_agent 列表序 = 首事件 → 入口守卫（HIGH 跳 end 直达 after_agent）；
+before_model 列表序 = 压缩 → 闸门；after_model 反序 = 闸门（#5 / #4）先于审批，闸门终止的 jump end 绕过审批，
+Approvals 是列表首个 after_model = 循环出口节点；wrap 各一件；after_agent 只有 RunEvents（末事件）。
 build_middleware 与本元组一一对应（静态测试互钉）。"""
 
 _HOOKS_PER_PHASE = {
@@ -72,10 +75,11 @@ class SessionBusy(RuntimeError):
 
 
 def build_middleware(gateway: BaseChatModel, spec: AgentSpec) -> list[AgentMiddleware]:
-    """按栈序实例化：需要依赖的中间件在这里注入——摘要模型 = 该租户网关（fast 档在调用时指定）、预算 = spec.context_config
-    （在指纹里，改预算即换图）。"""
+    """按栈序实例化：需要依赖的中间件在这里注入——入口分类器 = 该租户网关（仅 spec.entry_classifier 开通时，fast 档在调用时指定）、
+    摘要模型 = 该租户网关、预算 = spec.context_config（都在指纹里，改即换图）。"""
     return [
         RunEvents(),
+        Guards(gateway if spec.entry_classifier else None),
         AegisSummarization(gateway, config=spec.context_config),
         Approvals(),
         Gates(),

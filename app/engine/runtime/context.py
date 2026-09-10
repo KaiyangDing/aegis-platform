@@ -2,7 +2,8 @@
 
 只改 ModelRequest、不改 state：ModelCall.awrap_model_call 在调网关前调用 compile_prompt，把 request 的 system_message / messages
 换成编译产物；checkpoint 里的对话原文一字不动。六层（v1 03 §3）在 v2 的落点：
-  system：spec.system_prompt + 不可信数据声明（M2.8 再加入口打标）——超 system_budget 即 ValueError fail-loud（固定层没有合法降级，那是 L3 配置 bug）；
+  system：spec.system_prompt + 不可信数据声明 + 入口打标提醒（MEDIUM 时，本 run 有效；固定模板不插值用户内容）——超 system_budget 即
+    ValueError fail-loud（固定层没有合法降级，那是 L3 配置 bug）；
   长期记忆 / 本轮检索：槽位恒 None（M3 RAG）；
   会话历史：摘要消息（AegisSummarization 的产物，已在 state 里）+ 旧轮（每轮压成 user 原话 + 最终 assistant 文本；旧轮的工具往返不进 prompt）
     按 history_budget − 当前 user 输入 从最新往回装、装不下即停；有旧轮排队时摘要至多占一半版面（肥摘要不许挤掉最新轮）；
@@ -92,11 +93,15 @@ class CompiledPrompt:
         return [self.system, *self.messages]
 
 
-def compile_prompt(messages: Sequence[BaseMessage], spec: AgentSpec) -> CompiledPrompt:
-    """按层编译（v1 D12 次序）：system → [摘要 → 旧轮] → 当前 user → 本轮工作序列（工具结果层）。"""
+def compile_prompt(
+    messages: Sequence[BaseMessage], spec: AgentSpec, *, notice: str | None = None
+) -> CompiledPrompt:
+    """按层编译（v1 D12 次序）：system → [摘要 → 旧轮] → 当前 user → 本轮工作序列（工具结果层）。notice = 入口打标提醒（M2.8）。"""
     config = spec.context_config
-    # ① system 层：固定不可挤占——超预算没有合法降级
+    # ① system 层：固定不可挤占——超预算没有合法降级；入口打标与 system 同层受同一预算
     system_text = f"{spec.system_prompt}\n\n{u.UNTRUSTED_NOTICE}"
+    if notice:
+        system_text = f"{system_text}\n\n{notice}"
     system_cost = estimate_tokens(system_text)
     if system_cost > config.system_budget:
         raise ValueError(

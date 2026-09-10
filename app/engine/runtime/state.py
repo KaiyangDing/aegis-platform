@@ -1,5 +1,5 @@
 """图状态私有通道 + run 载体 + 钩子内事件发射（M2.3；M2.4 加取消信号与终止辅助；M2.5 加工具健康账与网关句柄；
-M2.7 通行证改为 {call id: approval_id}、载体加审批单存取件与前置校验挂点）。
+M2.7 通行证改为 {call id: approval_id}、载体加审批单存取件与前置校验挂点；M2.8 入口打标通道与出口守卫标记）。
 
 RunState：在框架 AgentState（messages / jump_to）之上加运行时私有通道，全部 PrivateStateAttr——不进 ainvoke 输出与 schema，
 但随 checkpoint 持久化且**跨 run 延续**（探针⑵）：run 级计数由 RunEvents.before_agent 显式归零（ADR-012 决策 8）。
@@ -46,6 +46,10 @@ AEGIS_SOURCE = "aegis_source"
 上下文编译（M2.6）据此区分"用户原话"与"运行时注入"；框架的摘要消息用它自己的 lc_source 键。"""
 SOURCE_PROTOCOL_RETRY = "protocol_retry"
 
+GUARDRAIL_TRUNCATED = "aegis_guardrail_truncated"
+"""出口守卫命中后被替换的 AIMessage 的标记键（additional_kwargs）：RunEvents.after_agent 据此在 assistant_message 事件里写
+guardrail_truncated=True（事件面标明这不是模型原话；llm_result 保留原文供审计）。"""
+
 INTERNAL_CALL_TAG = "aegis:internal"
 """增强层内部 LLM 调用（工具结果摘要 / 滚动摘要）的 tag：与框架 internal_call_metadata 并用，M3 SSE 据此不转发这些块。"""
 
@@ -67,7 +71,8 @@ FAIL_STREAK_LIMIT = 2
 class RunState(AgentState):
     """私有通道（无 reducer：后写覆盖）。iteration = 已发起的 LLM 调用数；tokens_used = 会话级估算累计（D8 种子起）；
     violations（闸门 #5 连续违规数）/ repeat（闸门 #4 的 {key, streak}）归 Gates（M2.4）；termination 是唯一终止信号（ADR-012 决策 3）；
-    approved_calls 是审批通行证 {模型侧 call id: approval_id}（M2.7 由 Approvals 单节点写入；ToolExec ③ 只读，write-ahead 后凭它回填审批单）。"""
+    approved_calls 是审批通行证 {模型侧 call id: approval_id}（M2.7 由 Approvals 单节点写入；ToolExec ③ 只读，write-ahead 后凭它回填审批单）；
+    entry_notice 是入口守卫的打标提醒（M2.8：MEDIUM 时由 Guards.before_agent 写入，ModelCall 编译进 system 层，本 run 有效）。"""
 
     iteration: NotRequired[Annotated[int, PrivateStateAttr]]
     tokens_used: NotRequired[Annotated[int, PrivateStateAttr]]
@@ -75,6 +80,7 @@ class RunState(AgentState):
     repeat: NotRequired[Annotated[dict[str, Any] | None, PrivateStateAttr]]
     termination: NotRequired[Annotated[dict[str, Any] | None, PrivateStateAttr]]
     approved_calls: NotRequired[Annotated[dict[str, str], PrivateStateAttr]]
+    entry_notice: NotRequired[Annotated[str | None, PrivateStateAttr]]
 
 
 def run_channels_reset(token_seed: int) -> dict[str, Any]:
@@ -86,6 +92,7 @@ def run_channels_reset(token_seed: int) -> dict[str, Any]:
         "repeat": None,
         "termination": None,
         "approved_calls": {},
+        "entry_notice": None,
     }
 
 
